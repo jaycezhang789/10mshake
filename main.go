@@ -44,10 +44,14 @@ type ticker24hr struct {
 	QuoteVolume string `json:"quoteVolume"`
 }
 
-type symbolChange struct {
-	Symbol string
-	Change float64 // 10分钟涨跌幅（百分比）
-	Last   float64 // 最新收盘价
+type symbolMetrics struct {
+	Symbol       string
+	Change10m    float64
+	Change30m    float64
+	Change60m    float64
+	Change120m   float64
+	Last         float64
+	AvgAmplitude float64
 }
 
 type config struct {
@@ -199,7 +203,7 @@ func run(cfg config) error {
 		ctxUpdate, cancel := context.WithTimeout(parent, 4*time.Minute)
 		defer cancel()
 
-		results := computeTopChanges(ctxUpdate, httpClient, snapshot, cfg.concurrency)
+		results := computeSymbolMetrics(ctxUpdate, httpClient, snapshot, cfg.concurrency)
 		if len(results) == 0 {
 			return errors.New("未能计算任何交易对的10分钟涨跌幅")
 		}
@@ -301,7 +305,7 @@ func filterAndRankTopHalfByVolume(all []ticker24hr, allowed map[string]struct{})
 	return top
 }
 
-func computeTopChanges(ctx context.Context, c *http.Client, symbols []string, concurrency int) []symbolChange {
+func computeSymbolMetrics(ctx context.Context, c *http.Client, symbols []string, concurrency int) []symbolMetrics {
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -309,7 +313,7 @@ func computeTopChanges(ctx context.Context, c *http.Client, symbols []string, co
 	sem := make(chan struct{}, concurrency)
 	wg := sync.WaitGroup{}
 	mu := sync.Mutex{}
-	res := make([]symbolChange, 0, len(symbols))
+	res := make([]symbolMetrics, 0, len(symbols))
 
 	for _, s := range symbols {
 		s := s
@@ -319,12 +323,12 @@ func computeTopChanges(ctx context.Context, c *http.Client, symbols []string, co
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			change, last, err := tenMinuteChange(ctx, c, s)
+			metrics, err := fetchSymbolMetrics(ctx, c, s)
 			if err != nil {
 				return
 			}
 			mu.Lock()
-			res = append(res, symbolChange{Symbol: s, Change: change, Last: last})
+			res = append(res, metrics)
 			mu.Unlock()
 		}()
 	}
@@ -332,29 +336,29 @@ func computeTopChanges(ctx context.Context, c *http.Client, symbols []string, co
 
 	// 按绝对涨跌幅降序
 	sort.Slice(res, func(i, j int) bool {
-		ai := math.Abs(res[i].Change)
-		aj := math.Abs(res[j].Change)
+		ai := math.Abs(res[i].Change10m)
+		aj := math.Abs(res[j].Change10m)
 		if ai == aj {
-			return res[i].Change > res[j].Change
+			return res[i].Change10m > res[j].Change10m
 		}
 		return ai > aj
 	})
 	return res
 }
 
-func splitTopMovers(results []symbolChange, top int) (gainers []symbolChange, losers []symbolChange) {
+func splitTopMovers(results []symbolMetrics, top int) (gainers []symbolMetrics, losers []symbolMetrics) {
 	if top < 1 {
 		top = 1
 	}
 	for _, r := range results {
-		if r.Change > 0 {
+		if r.Change10m > 0 {
 			gainers = append(gainers, r)
-		} else if r.Change < 0 {
+		} else if r.Change10m < 0 {
 			losers = append(losers, r)
 		}
 	}
-	sort.Slice(gainers, func(i, j int) bool { return gainers[i].Change > gainers[j].Change })
-	sort.Slice(losers, func(i, j int) bool { return losers[i].Change < losers[j].Change })
+	sort.Slice(gainers, func(i, j int) bool { return gainers[i].Change10m > gainers[j].Change10m })
+	sort.Slice(losers, func(i, j int) bool { return losers[i].Change10m < losers[j].Change10m })
 	if len(gainers) > top {
 		gainers = gainers[:top]
 	}
@@ -364,7 +368,7 @@ func splitTopMovers(results []symbolChange, top int) (gainers []symbolChange, lo
 	return gainers, losers
 }
 
-func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, losers []symbolChange) string {
+func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, losers []symbolMetrics) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("时间: %s\n", now.Format("2006-01-02 15:04:05")))
 	b.WriteString(fmt.Sprintf("成交量前50%%交易对数: %d\n", volumeCount))
@@ -376,7 +380,16 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 			b.WriteString(fmt.Sprintf("（仅 %d 个满足条件）\n", len(gainers)))
 		}
 		for i, g := range gainers {
-			b.WriteString(fmt.Sprintf("%2d) %-12s %+0.4f%%  收盘价: %.8f\n", i+1, g.Symbol, g.Change, g.Last))
+			b.WriteString(fmt.Sprintf("%2d) %-12s 10m:%+0.4f%% 30m:%+0.4f%% 1h:%+0.4f%% 2h:%+0.4f%% Avg振幅:%0.4f%% 收盘价: %.8f\n",
+				i+1,
+				g.Symbol,
+				g.Change10m,
+				g.Change30m,
+				g.Change60m,
+				g.Change120m,
+				g.AvgAmplitude,
+				g.Last,
+			))
 		}
 	}
 	b.WriteString("\n")
@@ -388,7 +401,16 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 			b.WriteString(fmt.Sprintf("（仅 %d 个满足条件）\n", len(losers)))
 		}
 		for i, l := range losers {
-			b.WriteString(fmt.Sprintf("%2d) %-12s %+0.4f%%  收盘价: %.8f\n", i+1, l.Symbol, l.Change, l.Last))
+			b.WriteString(fmt.Sprintf("%2d) %-12s 10m:%+0.4f%% 30m:%+0.4f%% 1h:%+0.4f%% 2h:%+0.4f%% Avg振幅:%0.4f%% 收盘价: %.8f\n",
+				i+1,
+				l.Symbol,
+				l.Change10m,
+				l.Change30m,
+				l.Change60m,
+				l.Change120m,
+				l.AvgAmplitude,
+				l.Last,
+			))
 		}
 	}
 	return strings.TrimSpace(b.String())
@@ -419,41 +441,125 @@ func sendTelegramMessage(ctx context.Context, c *http.Client, token, chatID, tex
 	return nil
 }
 
-func tenMinuteChange(ctx context.Context, c *http.Client, symbol string) (pct float64, last float64, err error) {
+func fetchSymbolMetrics(ctx context.Context, c *http.Client, symbol string) (symbolMetrics, error) {
+	metrics := symbolMetrics{Symbol: symbol}
 	url := fmt.Sprintf("%s%s?symbol=%s&interval=1m&limit=499", baseURL, klinesEP, symbol)
 	var raw [][]interface{}
 	if err := getJSON(ctx, c, url, &raw); err != nil {
-		return 0, 0, err
+		return metrics, err
 	}
-	if len(raw) < 12 { // 需要至少11根K线（10分钟前 + 最新）
-		return 0, 0, errors.New("K线数据不足")
+	if len(raw) < 121 {
+		return metrics, errors.New("K线数据不足")
 	}
+
 	closes := make([]float64, 0, len(raw))
+	highs := make([]float64, 0, len(raw))
+	lows := make([]float64, 0, len(raw))
 	for _, row := range raw {
 		if len(row) < 6 {
 			continue
 		}
-		// 收盘价在索引4，类型为字符串
-		closeStr, ok := row[4].(string)
-		if !ok {
+		closeStr, okClose := row[4].(string)
+		highStr, okHigh := row[2].(string)
+		lowStr, okLow := row[3].(string)
+		if !okClose || !okHigh || !okLow {
 			continue
 		}
-		v, err := strconv.ParseFloat(closeStr, 64)
+		closeVal, err := strconv.ParseFloat(closeStr, 64)
 		if err != nil {
 			continue
 		}
-		closes = append(closes, v)
+		highVal, err := strconv.ParseFloat(highStr, 64)
+		if err != nil {
+			continue
+		}
+		lowVal, err := strconv.ParseFloat(lowStr, 64)
+		if err != nil {
+			continue
+		}
+		closes = append(closes, closeVal)
+		highs = append(highs, highVal)
+		lows = append(lows, lowVal)
 	}
-	if len(closes) < 12 {
-		return 0, 0, errors.New("有效收盘价不足")
+
+	if len(closes) < 121 {
+		return metrics, errors.New("有效收盘价不足")
 	}
-	last = closes[len(closes)-1]
-	prev := closes[len(closes)-11] // 10分钟前收盘
-	if prev == 0 {
-		return 0, last, errors.New("前值为0")
+	metrics.Last = closes[len(closes)-1]
+
+	calcChange := func(minutes int) (float64, error) {
+		idx := len(closes) - (minutes + 1)
+		if idx < 0 || idx >= len(closes) {
+			return 0, errors.New("数据不足")
+		}
+		prev := closes[idx]
+		if prev == 0 {
+			return 0, errors.New("前值为0")
+		}
+		return (metrics.Last - prev) / prev * 100.0, nil
 	}
-	pct = (last - prev) / prev * 100.0
-	return pct, last, nil
+
+	var err error
+	if metrics.Change10m, err = calcChange(10); err != nil {
+		return metrics, err
+	}
+	if metrics.Change30m, err = calcChange(30); err != nil {
+		return metrics, err
+	}
+	if metrics.Change60m, err = calcChange(60); err != nil {
+		return metrics, err
+	}
+	if metrics.Change120m, err = calcChange(120); err != nil {
+		return metrics, err
+	}
+
+	metrics.AvgAmplitude = calculateAverageAmplitude(highs, lows, 10)
+	return metrics, nil
+}
+
+func calculateAverageAmplitude(highs, lows []float64, window int) float64 {
+	if len(highs) == 0 || len(lows) == 0 || window <= 0 {
+		return 0
+	}
+	if window > len(highs) {
+		window = len(highs)
+	}
+	start := len(highs) - window
+	amplitudes := make([]float64, 0, window)
+	for i := start; i < len(highs); i++ {
+		h := highs[i]
+		l := lows[i]
+		if l <= 0 || h < l {
+			continue
+		}
+		amp := (h - l) / l * 100.0
+		amplitudes = append(amplitudes, amp)
+	}
+	if len(amplitudes) == 0 {
+		return 0
+	}
+	return trimmedAverage(amplitudes, 2)
+}
+
+func trimmedAverage(values []float64, trim int) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	if len(values) <= trim*2 {
+		sum := 0.0
+		for _, v := range values {
+			sum += v
+		}
+		return sum / float64(len(values))
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	trimmed := sorted[trim : len(sorted)-trim]
+	sum := 0.0
+	for _, v := range trimmed {
+		sum += v
+	}
+	return sum / float64(len(trimmed))
 }
 
 func getJSON(ctx context.Context, c *http.Client, url string, v any) error {
