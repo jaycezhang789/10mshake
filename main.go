@@ -104,6 +104,11 @@ type symbolManager struct {
 	cfg      config
 }
 
+type symbolFilter struct {
+	stepSize float64
+	minQty   float64
+}
+
 type wsKlineEvent struct {
 	EventType string `json:"e"`
 	EventTime int64  `json:"E"`
@@ -358,6 +363,8 @@ type binanceClient struct {
 	recvWindow    int
 	settingsMu    sync.Mutex
 	configuredSym map[string]struct{}
+	filtersMu     sync.RWMutex
+	filters       map[string]symbolFilter
 }
 
 func newBinanceClient(httpClient *http.Client, cfg config) *binanceClient {
@@ -372,6 +379,7 @@ func newBinanceClientWithURL(httpClient *http.Client, cfg config, url string) *b
 		secret:        []byte(cfg.apiSecret),
 		recvWindow:    cfg.recvWindow,
 		configuredSym: make(map[string]struct{}),
+		filters:       make(map[string]symbolFilter),
 	}
 }
 
@@ -429,6 +437,34 @@ func (c *binanceClient) signedRequest(ctx context.Context, method, path string, 
 	return bodyBytes, nil
 }
 
+func (c *binanceClient) publicRequest(ctx context.Context, path string, params url.Values) ([]byte, error) {
+	endpoint := c.baseURL + path
+	if params != nil && len(params) > 0 {
+		if strings.Contains(endpoint, "?") {
+			endpoint = endpoint + "&" + params.Encode()
+		} else {
+			endpoint = endpoint + "?" + params.Encode()
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("binance public api error %d: %s", resp.StatusCode, string(body))
+	}
+	return body, nil
+}
+
 func (c *binanceClient) EnsureDualSide(ctx context.Context) error {
 	params := url.Values{}
 	params.Set("dualSidePosition", "true")
@@ -437,6 +473,24 @@ func (c *binanceClient) EnsureDualSide(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (c *binanceClient) FetchAvailableBalance(ctx context.Context) (float64, error) {
+	body, err := c.signedRequest(ctx, http.MethodGet, "/fapi/v2/account", nil)
+	if err != nil {
+		return 0, err
+	}
+	var payload struct {
+		AvailableBalance string `json:"availableBalance"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, err
+	}
+	bal, err := strconv.ParseFloat(payload.AvailableBalance, 64)
+	if err != nil {
+		return 0, err
+	}
+	return bal, nil
 }
 
 func (c *binanceClient) EnsureSymbolSettings(ctx context.Context, symbol string, leverage int) error {
@@ -476,6 +530,83 @@ func (c *binanceClient) setLeverage(ctx context.Context, symbol string, leverage
 	params.Set("leverage", strconv.Itoa(leverage))
 	_, err := c.signedRequest(ctx, http.MethodPost, "/fapi/v1/leverage", params)
 	return err
+}
+
+func (c *binanceClient) getSymbolFilter(ctx context.Context, symbol string) (symbolFilter, error) {
+	symbol = strings.ToUpper(symbol)
+	c.filtersMu.RLock()
+	if f, ok := c.filters[symbol]; ok {
+		c.filtersMu.RUnlock()
+		return f, nil
+	}
+	c.filtersMu.RUnlock()
+
+	params := url.Values{}
+	params.Set("symbol", symbol)
+	body, err := c.publicRequest(ctx, "/fapi/v1/exchangeInfo", params)
+	if err != nil {
+		return symbolFilter{}, err
+	}
+	var resp struct {
+		Symbols []struct {
+			Symbol  string `json:"symbol"`
+			Filters []struct {
+				FilterType string `json:"filterType"`
+				StepSize   string `json:"stepSize"`
+				MinQty     string `json:"minQty"`
+			} `json:"filters"`
+		} `json:"symbols"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return symbolFilter{}, err
+	}
+	var lot symbolFilter
+	for _, sym := range resp.Symbols {
+		if strings.EqualFold(sym.Symbol, symbol) {
+			for _, flt := range sym.Filters {
+				switch flt.FilterType {
+				case "MARKET_LOT_SIZE", "LOT_SIZE":
+					step, err := strconv.ParseFloat(flt.StepSize, 64)
+					if err != nil {
+						continue
+					}
+					min, err := strconv.ParseFloat(flt.MinQty, 64)
+					if err != nil {
+						continue
+					}
+					lot.stepSize = step
+					lot.minQty = min
+				}
+			}
+			break
+		}
+	}
+	if lot.stepSize <= 0 {
+		return symbolFilter{}, fmt.Errorf("未获取到 %s 的步长限制", symbol)
+	}
+	c.filtersMu.Lock()
+	c.filters[symbol] = lot
+	c.filtersMu.Unlock()
+	return lot, nil
+}
+
+func (c *binanceClient) AdjustQuantity(ctx context.Context, symbol string, qty float64) (float64, error) {
+	if qty <= 0 {
+		return 0, fmt.Errorf("下单数量无效")
+	}
+	filter, err := c.getSymbolFilter(ctx, symbol)
+	if err != nil {
+		return 0, err
+	}
+	if filter.stepSize <= 0 {
+		return 0, fmt.Errorf("%s 步长限制无效", symbol)
+	}
+	step := filter.stepSize
+	adjusted := math.Floor(qty/step) * step
+	if adjusted < filter.minQty {
+		return 0, fmt.Errorf("%s 数量 %.8f 低于最小下单量 %.8f", symbol, adjusted, filter.minQty)
+	}
+	return adjusted, nil
 }
 
 type orderRequest struct {
@@ -601,9 +732,10 @@ func (pm *positionManager) Remove(sym, side string) {
 	delete(pm.positions, positionKey{Symbol: sym, Side: side})
 }
 
-func (pm *positionManager) Load(entries []positionEntry) {
+func (pm *positionManager) Replace(entries []positionEntry) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+	pm.positions = make(map[positionKey]positionEntry, len(entries))
 	for _, e := range entries {
 		pm.positions[positionKey{Symbol: e.Symbol, Side: e.Side}] = e
 	}
@@ -613,15 +745,30 @@ type tradeManager struct {
 	client    *binanceClient
 	positions *positionManager
 	cfg       config
+	qtyMu     sync.RWMutex
+	qty       map[string]float64
 }
 
 func newTradeManager(client *binanceClient, positions []positionEntry, cfg config) *tradeManager {
 	pm := newPositionManager(cfg.maxPositions)
-	pm.Load(positions)
-	return &tradeManager{client: client, positions: pm, cfg: cfg}
+	pm.Replace(positions)
+	return &tradeManager{client: client, positions: pm, cfg: cfg, qty: make(map[string]float64)}
+}
+
+func (tm *tradeManager) refreshPositions(ctx context.Context) error {
+	entries, err := tm.client.FetchOpenPositions(ctx)
+	if err != nil {
+		return err
+	}
+	tm.positions.Replace(entries)
+	return nil
 }
 
 func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategyResult) {
+	if err := tm.refreshPositions(ctx); err != nil {
+		log.Printf("刷新持仓失败: %v", err)
+	}
+	tm.precomputeQuantities(ctx, strategies)
 	for _, sr := range strategies {
 		if tm.positions.Has(sr.Symbol, "LONG") {
 			if sr.EMAFast <= sr.EMASlow || sr.MACDHist <= 0 {
@@ -643,8 +790,12 @@ func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategy
 		if tm.positions.Remaining() <= 0 {
 			break
 		}
+		price := sr.Metrics.Last
+		if price <= 0 {
+			continue
+		}
 		if sr.LongSignal && !tm.positions.Has(sr.Symbol, "LONG") {
-			if err := tm.openPosition(ctx, sr.Symbol, "LONG"); err != nil {
+			if err := tm.openPosition(ctx, sr.Symbol, "LONG", price); err != nil {
 				log.Printf("开多单失败 %s: %v", sr.Symbol, err)
 			}
 		}
@@ -652,26 +803,27 @@ func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategy
 			break
 		}
 		if sr.ShortSignal && !tm.positions.Has(sr.Symbol, "SHORT") {
-			if err := tm.openPosition(ctx, sr.Symbol, "SHORT"); err != nil {
+			if err := tm.openPosition(ctx, sr.Symbol, "SHORT", price); err != nil {
 				log.Printf("开空单失败 %s: %v", sr.Symbol, err)
 			}
 		}
 	}
 }
 
-func (tm *tradeManager) openPosition(ctx context.Context, symbol, side string) error {
+func (tm *tradeManager) openPosition(ctx context.Context, symbol, side string, price float64) error {
 	if tm.positions.Count() >= tm.cfg.maxPositions {
 		return fmt.Errorf("已达到最大持仓数量")
 	}
-	if tm.cfg.orderQty <= 0 {
-		return fmt.Errorf("未设置下单数量")
+	qty, err := tm.determineOpenQuantity(ctx, symbol, price)
+	if err != nil {
+		return err
 	}
 	if err := tm.client.EnsureSymbolSettings(ctx, symbol, tm.cfg.leverage); err != nil {
 		return err
 	}
 	order := orderRequest{
 		Symbol:       symbol,
-		Quantity:     tm.cfg.orderQty,
+		Quantity:     qty,
 		ReduceOnly:   false,
 		PositionSide: side,
 	}
@@ -686,9 +838,108 @@ func (tm *tradeManager) openPosition(ctx context.Context, symbol, side string) e
 	if err := tm.client.PlaceOrder(ctx, order); err != nil {
 		return err
 	}
-	tm.positions.Set(symbol, side, tm.cfg.orderQty)
-	log.Printf("%s %s 开仓成功，数量 %s", symbol, side, formatQuantity(tm.cfg.orderQty))
+	if err := tm.refreshPositions(ctx); err != nil {
+		log.Printf("刷新持仓失败: %v", err)
+		tm.positions.Set(symbol, side, qty)
+	}
+	log.Printf("%s %s 开仓成功，数量 %s", symbol, side, formatQuantity(qty))
 	return nil
+}
+
+func (tm *tradeManager) determineOpenQuantity(ctx context.Context, symbol string, price float64) (float64, error) {
+	if price <= 0 {
+		return 0, fmt.Errorf("%s 无效价格", symbol)
+	}
+	if tm.cfg.orderQty > 0 {
+		return tm.client.AdjustQuantity(ctx, symbol, tm.cfg.orderQty)
+	}
+	remaining := tm.positions.Remaining()
+	if remaining <= 0 {
+		return 0, fmt.Errorf("无可用仓位")
+	}
+	available, err := tm.client.FetchAvailableBalance(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if available <= 0 {
+		return 0, fmt.Errorf("可用余额不足")
+	}
+	notionalPerPosition := (available * float64(tm.cfg.leverage)) / float64(remaining)
+	if notionalPerPosition <= 0 {
+		return 0, fmt.Errorf("无有效名义资金")
+	}
+	qty := notionalPerPosition / price
+	return tm.client.AdjustQuantity(ctx, symbol, qty)
+}
+
+func (tm *tradeManager) precomputeQuantities(ctx context.Context, strategies []strategyResult) {
+	tm.qtyMu.Lock()
+	tm.qty = make(map[string]float64)
+	tm.qtyMu.Unlock()
+	if len(strategies) == 0 {
+		return
+	}
+	remaining := tm.positions.Remaining()
+	if remaining <= 0 {
+		return
+	}
+	var available float64
+	var availErr error
+	if tm.cfg.orderQty <= 0 {
+		available, availErr = tm.client.FetchAvailableBalance(ctx)
+		if availErr != nil {
+			log.Printf("获取账户余额失败: %v", availErr)
+			return
+		}
+		if available <= 0 {
+			log.Printf("账户可用余额不足，无法计算下单数量")
+			return
+		}
+	}
+	for _, sr := range strategies {
+		price := sr.Metrics.Last
+		if price <= 0 {
+			continue
+		}
+		var qty float64
+		var err error
+		if tm.cfg.orderQty > 0 {
+			qty, err = tm.client.AdjustQuantity(ctx, sr.Symbol, tm.cfg.orderQty)
+		} else {
+			notionalPerPosition := (available * float64(tm.cfg.leverage)) / float64(remaining)
+			if notionalPerPosition <= 0 {
+				continue
+			}
+			quantity := notionalPerPosition / price
+			qty, err = tm.client.AdjustQuantity(ctx, sr.Symbol, quantity)
+		}
+		if err != nil || qty <= 0 {
+			continue
+		}
+		tm.setCachedQty(sr.Symbol, qty)
+	}
+}
+
+func (tm *tradeManager) setCachedQty(symbol string, qty float64) {
+	tm.qtyMu.Lock()
+	defer tm.qtyMu.Unlock()
+	if tm.qty == nil {
+		tm.qty = make(map[string]float64)
+	}
+	tm.qty[strings.ToUpper(symbol)] = qty
+}
+
+func (tm *tradeManager) snapshotQuantities() map[string]float64 {
+	tm.qtyMu.RLock()
+	defer tm.qtyMu.RUnlock()
+	if len(tm.qty) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(tm.qty))
+	for k, v := range tm.qty {
+		out[k] = v
+	}
+	return out
 }
 
 func (tm *tradeManager) closePosition(ctx context.Context, symbol, side string) error {
@@ -700,9 +951,13 @@ func (tm *tradeManager) closePosition(ctx context.Context, symbol, side string) 
 	if qty <= 0 {
 		qty = tm.cfg.orderQty
 	}
+	adjQty, err := tm.client.AdjustQuantity(ctx, symbol, qty)
+	if err != nil {
+		return err
+	}
 	order := orderRequest{
 		Symbol:       symbol,
-		Quantity:     qty,
+		Quantity:     adjQty,
 		ReduceOnly:   true,
 		PositionSide: side,
 	}
@@ -717,8 +972,11 @@ func (tm *tradeManager) closePosition(ctx context.Context, symbol, side string) 
 	if err := tm.client.PlaceOrder(ctx, order); err != nil {
 		return err
 	}
-	tm.positions.Remove(symbol, side)
-	log.Printf("%s %s 平仓成功，数量 %s", symbol, side, formatQuantity(qty))
+	if err := tm.refreshPositions(ctx); err != nil {
+		log.Printf("刷新持仓失败: %v", err)
+		tm.positions.Remove(symbol, side)
+	}
+	log.Printf("%s %s 平仓成功，数量 %s", symbol, side, formatQuantity(adjQty))
 	return nil
 }
 
@@ -1031,10 +1289,12 @@ func run(cfg config) error {
 			watchMgr.EnsureWatchers(ctx, watchSymbols)
 		}
 		strategies := watchMgr.EvaluateStrategies(watchSymbols)
+		var qtyMap map[string]float64
 		if cfg.autoTrade && tradeMgr != nil {
 			tradeMgr.HandleSignals(ctxUpdate, strategies)
+			qtyMap = tradeMgr.snapshotQuantities()
 		}
-		message := buildTelegramMessage(time.Now(), len(snapshot), cfg.top, gainers, losers, strategies, watchSymbols)
+		message := buildTelegramMessage(time.Now(), len(snapshot), cfg.top, gainers, losers, strategies, watchSymbols, qtyMap)
 		if message == "" {
 			return errors.New("推送内容为空")
 		}
@@ -1219,7 +1479,7 @@ func selectTopSymbols(results []symbolMetrics, count int) []string {
 	return symbols
 }
 
-func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, losers []symbolMetrics, strategies []strategyResult, watchSymbols []string) string {
+func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, losers []symbolMetrics, strategies []strategyResult, watchSymbols []string, qtyMap map[string]float64) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("时间: %s\n", now.Format("2006-01-02 15:04:05")))
 	b.WriteString(fmt.Sprintf("成交量前50%%交易对数: %d\n", volumeCount))
@@ -1234,7 +1494,7 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 			b.WriteString(fmt.Sprintf("（仅 %d 个满足条件）\n", len(gainers)))
 		}
 		for i, g := range gainers {
-			b.WriteString(fmt.Sprintf("%2d) %-12s 10m:%+0.4f%% 30m:%+0.4f%% 1h:%+0.4f%% 2h:%+0.4f%% Avg振幅:%0.4f%% 收盘价: %.8f\n",
+			b.WriteString(fmt.Sprintf("%2d) %-12s 10m:%+0.4f%% 30m:%+0.4f%% 1h:%+0.4f%% 2h:%+0.4f%% Avg振幅:%0.4f%% 收盘价: %.8f%s\n",
 				i+1,
 				g.Symbol,
 				g.Change10m,
@@ -1243,6 +1503,7 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 				g.Change120m,
 				g.AvgAmplitude,
 				g.Last,
+				formatQtyInfo(qtyMap, g.Symbol),
 			))
 		}
 	}
@@ -1255,7 +1516,7 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 			b.WriteString(fmt.Sprintf("（仅 %d 个满足条件）\n", len(losers)))
 		}
 		for i, l := range losers {
-			b.WriteString(fmt.Sprintf("%2d) %-12s 10m:%+0.4f%% 30m:%+0.4f%% 1h:%+0.4f%% 2h:%+0.4f%% Avg振幅:%0.4f%% 收盘价: %.8f\n",
+			b.WriteString(fmt.Sprintf("%2d) %-12s 10m:%+0.4f%% 30m:%+0.4f%% 1h:%+0.4f%% 2h:%+0.4f%% Avg振幅:%0.4f%% 收盘价: %.8f%s\n",
 				i+1,
 				l.Symbol,
 				l.Change10m,
@@ -1264,6 +1525,7 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 				l.Change120m,
 				l.AvgAmplitude,
 				l.Last,
+				formatQtyInfo(qtyMap, l.Symbol),
 			))
 		}
 	}
@@ -1281,7 +1543,7 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 			if sr.ShortSignal {
 				shortStatus = "S✅"
 			}
-			b.WriteString(fmt.Sprintf("%s/%s %-10s 10m:%+0.4f%% Avg振幅:%0.4f%% EMA快:%0.4f(Δ%0.4f) EMA慢:%0.4f(Δ%0.4f) MACD_H:%0.4f→%0.4f ADX:%0.2f\n",
+			b.WriteString(fmt.Sprintf("%s/%s %-10s 10m:%+0.4f%% Avg振幅:%0.4f%% EMA快:%0.4f(Δ%0.4f) EMA慢:%0.4f(Δ%0.4f) MACD_H:%0.4f→%0.4f ADX:%0.2f%s\n",
 				longStatus,
 				shortStatus,
 				sr.Symbol,
@@ -1294,10 +1556,22 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 				sr.MACDHist,
 				sr.MACDPrev,
 				sr.ADX,
+				formatQtyInfo(qtyMap, sr.Symbol),
 			))
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func formatQtyInfo(qtyMap map[string]float64, symbol string) string {
+	if qtyMap == nil {
+		return ""
+	}
+	q, ok := qtyMap[strings.ToUpper(symbol)]
+	if !ok || q <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" Qty:%s", formatQuantity(q))
 }
 
 func sendTelegramMessage(ctx context.Context, c *http.Client, token, chatID, text string) error {
