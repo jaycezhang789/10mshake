@@ -35,6 +35,11 @@ go build -o 10mshake
 - `-ema-fast`、`-ema-slow` 5m EMA 快慢线周期，默认 12/26。
 - `-adx-period` 5m ADX 计算周期，默认 14。
 - `-adx-threshold` ADX 趋势强度阈值，默认 25。
+- `-auto-trade` 启用自动下单逻辑，默认关闭。
+- `-order-qty` 每笔下单数量（或设置 `BINANCE_ORDER_QTY` 环境变量），默认 0（关闭自动交易）。
+- `-max-positions` 最大持仓数量，默认 5。
+- `-leverage` 杠杆倍数，默认 5。
+- `-recv-window` Binance API 请求 recvWindow，默认 5000ms。
 
 示例：
 
@@ -60,3 +65,14 @@ go run . -concurrency 8 -top 15 -update-interval 5m -volume-refresh 6h
 - 平均振幅按最近 10 条 1m K 线的 `(high - low) / low` 计算，去掉 2 个最大值和最小值后求均值。
 - WebSocket 监听默认保留最近 1500 条 1m K 线，并基于这些数据合成 5m K 线与指标。
 - 代码已使用 `gofmt` 整理；后续如需格式化，可执行 `/usr/local/go/bin/gofmt -w main.go`。
+
+## 自动下单说明
+
+- 通过 `-auto-trade` 开启真实交易；需在 `.env` 或环境变量中配置 `BINANCE_API_KEY`、`BINANCE_API_SECRET`。
+- 每笔下单数量可通过 `-order-qty` 或 `BINANCE_ORDER_QTY` 指定；程序默认使用全仓、双向持仓，并自动设置 5 倍杠杆（可调）。
+- 依据策略：
+  - 开多：`EMA_fast > EMA_slow` 且快慢线斜率向上，`MACD_H>0` 且放大（较上一棒增加），`ADX>阈值`。
+  - 平多：`EMA_fast <= EMA_slow` 或 `MACD_H <= 0`。
+  - 开空：条件同开多但方向相反。
+  - 平空：`EMA_fast >= EMA_slow` 或 `MACD_H >= 0`。
+- 最大持仓默认为 5；超过即暂停加仓。每次下单前会再次检查剩余可用仓位。

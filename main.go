@@ -3,6 +3,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -82,7 +85,8 @@ type strategyResult struct {
 	MACDHist     float64
 	MACDPrev     float64
 	ADX          float64
-	Passed       bool
+	LongSignal   bool
+	ShortSignal  bool
 }
 
 type symbolWatcher struct {
@@ -346,6 +350,378 @@ func (w *symbolWatcher) Close() {
 	<-w.done
 }
 
+type binanceClient struct {
+	baseURL       string
+	client        *http.Client
+	apiKey        string
+	secret        []byte
+	recvWindow    int
+	settingsMu    sync.Mutex
+	configuredSym map[string]struct{}
+}
+
+func newBinanceClient(httpClient *http.Client, cfg config) *binanceClient {
+	return newBinanceClientWithURL(httpClient, cfg, baseURL)
+}
+
+func newBinanceClientWithURL(httpClient *http.Client, cfg config, url string) *binanceClient {
+	return &binanceClient{
+		baseURL:       url,
+		client:        httpClient,
+		apiKey:        cfg.apiKey,
+		secret:        []byte(cfg.apiSecret),
+		recvWindow:    cfg.recvWindow,
+		configuredSym: make(map[string]struct{}),
+	}
+}
+
+func (c *binanceClient) sign(query string) string {
+	mac := hmac.New(sha256.New, c.secret)
+	mac.Write([]byte(query))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (c *binanceClient) signedRequest(ctx context.Context, method, path string, params url.Values) ([]byte, error) {
+	if params == nil {
+		params = url.Values{}
+	}
+	params.Set("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	params.Set("recvWindow", strconv.Itoa(c.recvWindow))
+	query := params.Encode()
+	signature := c.sign(query)
+	params.Set("signature", signature)
+	finalQuery := params.Encode()
+
+	var body io.Reader
+	endpoint := c.baseURL + path
+	if method == http.MethodGet || method == http.MethodDelete {
+		if strings.Contains(endpoint, "?") {
+			endpoint = endpoint + "&" + finalQuery
+		} else {
+			endpoint = endpoint + "?" + finalQuery
+		}
+	} else {
+		body = strings.NewReader(finalQuery)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-MBX-APIKEY", c.apiKey)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("binance api error %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+	return bodyBytes, nil
+}
+
+func (c *binanceClient) EnsureDualSide(ctx context.Context) error {
+	params := url.Values{}
+	params.Set("dualSidePosition", "true")
+	_, err := c.signedRequest(ctx, http.MethodPost, "/fapi/v1/positionSide/dual", params)
+	if err != nil && !strings.Contains(err.Error(), "-4059") {
+		return err
+	}
+	return nil
+}
+
+func (c *binanceClient) EnsureSymbolSettings(ctx context.Context, symbol string, leverage int) error {
+	c.settingsMu.Lock()
+	if _, ok := c.configuredSym[symbol]; ok {
+		c.settingsMu.Unlock()
+		return nil
+	}
+	c.settingsMu.Unlock()
+
+	if err := c.setMarginType(ctx, symbol, "CROSSED"); err != nil {
+		if !strings.Contains(err.Error(), "-4046") { // Margin type already set
+			return err
+		}
+	}
+	if err := c.setLeverage(ctx, symbol, leverage); err != nil {
+		return err
+	}
+
+	c.settingsMu.Lock()
+	c.configuredSym[symbol] = struct{}{}
+	c.settingsMu.Unlock()
+	return nil
+}
+
+func (c *binanceClient) setMarginType(ctx context.Context, symbol, marginType string) error {
+	params := url.Values{}
+	params.Set("symbol", symbol)
+	params.Set("marginType", marginType)
+	_, err := c.signedRequest(ctx, http.MethodPost, "/fapi/v1/marginType", params)
+	return err
+}
+
+func (c *binanceClient) setLeverage(ctx context.Context, symbol string, leverage int) error {
+	params := url.Values{}
+	params.Set("symbol", symbol)
+	params.Set("leverage", strconv.Itoa(leverage))
+	_, err := c.signedRequest(ctx, http.MethodPost, "/fapi/v1/leverage", params)
+	return err
+}
+
+type orderRequest struct {
+	Symbol       string
+	Side         string
+	PositionSide string
+	Quantity     float64
+	ReduceOnly   bool
+}
+
+func (c *binanceClient) PlaceOrder(ctx context.Context, req orderRequest) error {
+	params := url.Values{}
+	params.Set("symbol", req.Symbol)
+	params.Set("side", req.Side)
+	params.Set("type", "MARKET")
+	params.Set("quantity", formatQuantity(req.Quantity))
+	params.Set("positionSide", req.PositionSide)
+	if req.ReduceOnly {
+		params.Set("reduceOnly", "true")
+	}
+	_, err := c.signedRequest(ctx, http.MethodPost, "/fapi/v1/order", params)
+	return err
+}
+
+type positionEntry struct {
+	Symbol string
+	Side   string
+	Qty    float64
+}
+
+func (c *binanceClient) FetchOpenPositions(ctx context.Context) ([]positionEntry, error) {
+	body, err := c.signedRequest(ctx, http.MethodGet, "/fapi/v2/positionRisk", url.Values{})
+	if err != nil {
+		return nil, err
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	positions := make([]positionEntry, 0)
+	for _, item := range payload {
+		symbol, _ := item["symbol"].(string)
+		posSide, _ := item["positionSide"].(string)
+		qtyStr, _ := item["positionAmt"].(string)
+		if symbol == "" || posSide == "" || qtyStr == "" {
+			continue
+		}
+		size, err := strconv.ParseFloat(qtyStr, 64)
+		if err != nil {
+			continue
+		}
+		if math.Abs(size) < 1e-8 {
+			continue
+		}
+		if size < 0 {
+			size = math.Abs(size)
+		}
+		positions = append(positions, positionEntry{Symbol: symbol, Side: posSide, Qty: size})
+	}
+	return positions, nil
+}
+
+func formatQuantity(q float64) string {
+	return strconv.FormatFloat(q, 'f', -1, 64)
+}
+
+type positionKey struct {
+	Symbol string
+	Side   string
+}
+
+type positionManager struct {
+	mu           sync.RWMutex
+	positions    map[positionKey]positionEntry
+	maxPositions int
+}
+
+func newPositionManager(max int) *positionManager {
+	return &positionManager{
+		positions:    make(map[positionKey]positionEntry),
+		maxPositions: max,
+	}
+}
+
+func (pm *positionManager) Count() int {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return len(pm.positions)
+}
+
+func (pm *positionManager) Remaining() int {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if len(pm.positions) >= pm.maxPositions {
+		return 0
+	}
+	return pm.maxPositions - len(pm.positions)
+}
+
+func (pm *positionManager) Has(symbol, side string) bool {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	_, ok := pm.positions[positionKey{Symbol: symbol, Side: side}]
+	return ok
+}
+
+func (pm *positionManager) Get(symbol, side string) (positionEntry, bool) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	val, ok := pm.positions[positionKey{Symbol: symbol, Side: side}]
+	return val, ok
+}
+
+func (pm *positionManager) Set(sym, side string, qty float64) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.positions[positionKey{Symbol: sym, Side: side}] = positionEntry{Symbol: sym, Side: side, Qty: qty}
+}
+
+func (pm *positionManager) Remove(sym, side string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	delete(pm.positions, positionKey{Symbol: sym, Side: side})
+}
+
+func (pm *positionManager) Load(entries []positionEntry) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for _, e := range entries {
+		pm.positions[positionKey{Symbol: e.Symbol, Side: e.Side}] = e
+	}
+}
+
+type tradeManager struct {
+	client    *binanceClient
+	positions *positionManager
+	cfg       config
+}
+
+func newTradeManager(client *binanceClient, positions []positionEntry, cfg config) *tradeManager {
+	pm := newPositionManager(cfg.maxPositions)
+	pm.Load(positions)
+	return &tradeManager{client: client, positions: pm, cfg: cfg}
+}
+
+func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategyResult) {
+	for _, sr := range strategies {
+		if tm.positions.Has(sr.Symbol, "LONG") {
+			if sr.EMAFast <= sr.EMASlow || sr.MACDHist <= 0 {
+				if err := tm.closePosition(ctx, sr.Symbol, "LONG"); err != nil {
+					log.Printf("平多单失败 %s: %v", sr.Symbol, err)
+				}
+			}
+		}
+		if tm.positions.Has(sr.Symbol, "SHORT") {
+			if sr.EMAFast >= sr.EMASlow || sr.MACDHist >= 0 {
+				if err := tm.closePosition(ctx, sr.Symbol, "SHORT"); err != nil {
+					log.Printf("平空单失败 %s: %v", sr.Symbol, err)
+				}
+			}
+		}
+	}
+
+	for _, sr := range strategies {
+		if tm.positions.Remaining() <= 0 {
+			break
+		}
+		if sr.LongSignal && !tm.positions.Has(sr.Symbol, "LONG") {
+			if err := tm.openPosition(ctx, sr.Symbol, "LONG"); err != nil {
+				log.Printf("开多单失败 %s: %v", sr.Symbol, err)
+			}
+		}
+		if tm.positions.Remaining() <= 0 {
+			break
+		}
+		if sr.ShortSignal && !tm.positions.Has(sr.Symbol, "SHORT") {
+			if err := tm.openPosition(ctx, sr.Symbol, "SHORT"); err != nil {
+				log.Printf("开空单失败 %s: %v", sr.Symbol, err)
+			}
+		}
+	}
+}
+
+func (tm *tradeManager) openPosition(ctx context.Context, symbol, side string) error {
+	if tm.positions.Count() >= tm.cfg.maxPositions {
+		return fmt.Errorf("已达到最大持仓数量")
+	}
+	if tm.cfg.orderQty <= 0 {
+		return fmt.Errorf("未设置下单数量")
+	}
+	if err := tm.client.EnsureSymbolSettings(ctx, symbol, tm.cfg.leverage); err != nil {
+		return err
+	}
+	order := orderRequest{
+		Symbol:       symbol,
+		Quantity:     tm.cfg.orderQty,
+		ReduceOnly:   false,
+		PositionSide: side,
+	}
+	switch side {
+	case "LONG":
+		order.Side = "BUY"
+	case "SHORT":
+		order.Side = "SELL"
+	default:
+		return fmt.Errorf("未知的持仓方向: %s", side)
+	}
+	if err := tm.client.PlaceOrder(ctx, order); err != nil {
+		return err
+	}
+	tm.positions.Set(symbol, side, tm.cfg.orderQty)
+	log.Printf("%s %s 开仓成功，数量 %s", symbol, side, formatQuantity(tm.cfg.orderQty))
+	return nil
+}
+
+func (tm *tradeManager) closePosition(ctx context.Context, symbol, side string) error {
+	entry, ok := tm.positions.Get(symbol, side)
+	if !ok {
+		return nil
+	}
+	qty := entry.Qty
+	if qty <= 0 {
+		qty = tm.cfg.orderQty
+	}
+	order := orderRequest{
+		Symbol:       symbol,
+		Quantity:     qty,
+		ReduceOnly:   true,
+		PositionSide: side,
+	}
+	switch side {
+	case "LONG":
+		order.Side = "SELL"
+	case "SHORT":
+		order.Side = "BUY"
+	default:
+		return fmt.Errorf("未知的持仓方向: %s", side)
+	}
+	if err := tm.client.PlaceOrder(ctx, order); err != nil {
+		return err
+	}
+	tm.positions.Remove(symbol, side)
+	log.Printf("%s %s 平仓成功，数量 %s", symbol, side, formatQuantity(qty))
+	return nil
+}
+
 func fetchHistorical1m(ctx context.Context, c *http.Client, symbol string, limit int) ([]candle, error) {
 	url := fmt.Sprintf("%s%s?symbol=%s&interval=1m&limit=%d", baseURL, klinesEP, symbol, limit)
 	var raw [][]interface{}
@@ -413,6 +789,13 @@ type config struct {
 	emaSlowPeriod  int
 	adxPeriod      int
 	adxThreshold   float64
+	autoTrade      bool
+	orderQty       float64
+	maxPositions   int
+	leverage       int
+	recvWindow     int
+	apiKey         string
+	apiSecret      string
 }
 
 func main() {
@@ -481,7 +864,21 @@ func parseConfig() config {
 	emaSlow := flag.Int("ema-slow", 26, "5m EMA 慢速周期")
 	adxPeriod := flag.Int("adx-period", 14, "5m ADX 周期")
 	adxThreshold := flag.Float64("adx-threshold", 25, "ADX 趋势判断阈值")
+	autoTrade := flag.Bool("auto-trade", false, "启用自动下单")
+	orderQty := flag.Float64("order-qty", 0, "每次下单的合约张数/数量")
+	maxPositions := flag.Int("max-positions", 5, "最大持仓数量")
+	leverage := flag.Int("leverage", 5, "杠杆倍数")
+	recvWindow := flag.Int("recv-window", 5000, "Binance API recvWindow (毫秒)")
 	flag.Parse()
+
+	qty := *orderQty
+	if qty <= 0 {
+		if v := os.Getenv("BINANCE_ORDER_QTY"); v != "" {
+			if parsed, err := strconv.ParseFloat(v, 64); err == nil && parsed > 0 {
+				qty = parsed
+			}
+		}
+	}
 
 	cfg := config{
 		concurrency:    *concurrency,
@@ -495,6 +892,13 @@ func parseConfig() config {
 		emaSlowPeriod:  *emaSlow,
 		adxPeriod:      *adxPeriod,
 		adxThreshold:   *adxThreshold,
+		autoTrade:      *autoTrade,
+		orderQty:       qty,
+		maxPositions:   *maxPositions,
+		leverage:       *leverage,
+		recvWindow:     *recvWindow,
+		apiKey:         os.Getenv("BINANCE_API_KEY"),
+		apiSecret:      os.Getenv("BINANCE_API_SECRET"),
 	}
 	if cfg.concurrency < 1 {
 		cfg.concurrency = 1
@@ -526,12 +930,29 @@ func parseConfig() config {
 	if cfg.adxThreshold <= 0 {
 		cfg.adxThreshold = 25
 	}
+	if cfg.maxPositions < 1 {
+		cfg.maxPositions = 5
+	}
+	if cfg.leverage < 1 {
+		cfg.leverage = 5
+	}
+	if cfg.recvWindow <= 0 {
+		cfg.recvWindow = 5000
+	}
 	return cfg
 }
 
 func run(cfg config) error {
 	if cfg.telegramToken == "" || cfg.telegramChatID == "" {
 		return errors.New("未配置 Telegram 凭证：请在环境变量 TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID 中设置")
+	}
+	if cfg.autoTrade {
+		if cfg.apiKey == "" || cfg.apiSecret == "" {
+			return errors.New("启用自动下单需要配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
+		}
+		if cfg.orderQty <= 0 {
+			return errors.New("启用自动下单需要通过 -order-qty 或 BINANCE_ORDER_QTY 设置正数数量")
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -540,6 +961,20 @@ func run(cfg config) error {
 	httpClient := &http.Client{Timeout: 12 * time.Second}
 	watchMgr := newSymbolManager(httpClient, cfg)
 	defer watchMgr.Close()
+
+	var tradeMgr *tradeManager
+	if cfg.autoTrade {
+		binance := newBinanceClient(httpClient, cfg)
+		if err := binance.EnsureDualSide(ctx); err != nil {
+			return fmt.Errorf("设置双向持仓失败: %w", err)
+		}
+		positions, err := binance.FetchOpenPositions(ctx)
+		if err != nil {
+			return fmt.Errorf("获取当前持仓失败: %w", err)
+		}
+		tradeMgr = newTradeManager(binance, positions, cfg)
+		log.Printf("当前持仓数量: %d / %d", tradeMgr.positions.Count(), cfg.maxPositions)
+	}
 
 	var (
 		symbols   []string
@@ -596,6 +1031,9 @@ func run(cfg config) error {
 			watchMgr.EnsureWatchers(ctx, watchSymbols)
 		}
 		strategies := watchMgr.EvaluateStrategies(watchSymbols)
+		if cfg.autoTrade && tradeMgr != nil {
+			tradeMgr.HandleSignals(ctxUpdate, strategies)
+		}
 		message := buildTelegramMessage(time.Now(), len(snapshot), cfg.top, gainers, losers, strategies, watchSymbols)
 		if message == "" {
 			return errors.New("推送内容为空")
@@ -835,12 +1273,17 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 		b.WriteString("暂无监听数据或数据不足\n")
 	} else {
 		for _, sr := range strategies {
-			status := "❌"
-			if sr.Passed {
-				status = "✅"
+			longStatus := "L❌"
+			if sr.LongSignal {
+				longStatus = "L✅"
 			}
-			b.WriteString(fmt.Sprintf("%s %-10s 10m:%+0.4f%% Avg振幅:%0.4f%% EMA快:%0.4f(Δ%0.4f) EMA慢:%0.4f(Δ%0.4f) MACD_H:%0.4f→%0.4f ADX:%0.2f\n",
-				status,
+			shortStatus := "S❌"
+			if sr.ShortSignal {
+				shortStatus = "S✅"
+			}
+			b.WriteString(fmt.Sprintf("%s/%s %-10s 10m:%+0.4f%% Avg振幅:%0.4f%% EMA快:%0.4f(Δ%0.4f) EMA慢:%0.4f(Δ%0.4f) MACD_H:%0.4f→%0.4f ADX:%0.2f\n",
+				longStatus,
+				shortStatus,
 				sr.Symbol,
 				sr.Metrics.Change10m,
 				sr.Metrics.AvgAmplitude,
@@ -940,7 +1383,10 @@ func computeStrategyFromCandles(symbol string, candles []candle, cfg config) (st
 	}
 	result.ADX = adxVal
 
-	result.Passed = fastCurrent > slowCurrent && result.EMAFastSlope > 0 && result.EMASlowSlope > 0 && macdHist > 0 && macdHist > macdPrev && adxVal > cfg.adxThreshold
+	longSignal := fastCurrent > slowCurrent && result.EMAFastSlope > 0 && result.EMASlowSlope > 0 && macdHist > 0 && macdHist > macdPrev && adxVal > cfg.adxThreshold
+	shortSignal := fastCurrent < slowCurrent && result.EMAFastSlope < 0 && result.EMASlowSlope < 0 && macdHist < 0 && macdHist < macdPrev && adxVal > cfg.adxThreshold
+	result.LongSignal = longSignal
+	result.ShortSignal = shortSignal
 	return result, nil
 }
 
