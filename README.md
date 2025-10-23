@@ -6,8 +6,12 @@ Go 程序，用于监控币安 U 本位永续合约，定期筛选出成交量�
 
 - 每 12 小时重新获取一次所有 USDT 永续合约的 24h 基础资产成交量，并筛选成交量前 50% 的交易对。
 - 每 10 分钟拉取这些交易对的 1m K 线（499 条），计算最近 10 分钟涨跌幅。
-- 推送消息中同时展示 30 分钟、1 小时、2 小时的涨跌幅，并统计最近 10 分钟的平均每分钟振幅（剔除 2 个最大值与最小值）。
 - 分别统计最近 10 分钟涨幅、跌幅前 N 名（默认 10），发送文本消息到 Telegram 指定聊天。
+- 对涨跌榜排序后的前 `watch-count` 个交易对建立 1m WebSocket 监听，首次拉取 1500 条 1m K 线并持续更新。
+- 基于监听到的 1m 数据合成 5m K 线，额外计算 30 分钟、1 小时、2 小时涨跌幅、平均振幅，以及 5m 周期的 EMA/MACD/ADX 指标，并在推送中展示策略是否满足：
+  - EMA 发散：EMA(fast) > EMA(slow) 且二者斜率向上
+  - MACD 动量：MACD_H > 0 且柱状图放大
+  - ADX 强度：ADX > `adx-threshold`
 - 自动加载 `.env` 文件（若存在），便于管理私密凭证。
 
 ## 运行
@@ -27,6 +31,10 @@ go build -o 10mshake
 - `-top` 涨跌榜数量（涨、跌各 N 名），默认 10。
 - `-update-interval` 涨跌榜推送周期，默认 `10m`。
 - `-volume-refresh` 成交量榜刷新周期，默认 `12h`。
+- `-watch-count` 需要建立 WebSocket 监听的交易对数量，默认 20。
+- `-ema-fast`、`-ema-slow` 5m EMA 快慢线周期，默认 12/26。
+- `-adx-period` 5m ADX 计算周期，默认 14。
+- `-adx-threshold` ADX 趋势强度阈值，默认 25。
 
 示例：
 
@@ -50,4 +58,5 @@ go run . -concurrency 8 -top 15 -update-interval 5m -volume-refresh 6h
 - 对 HTTP 请求增加了简单的重试与并发限制以减少触发限频的风险。
 - Telegram 推送基于 `sendMessage` 接口，如需富文本可自行扩展格式化逻辑。
 - 平均振幅按最近 10 条 1m K 线的 `(high - low) / low` 计算，去掉 2 个最大值和最小值后求均值。
+- WebSocket 监听默认保留最近 1500 条 1m K 线，并基于这些数据合成 5m K 线与指标。
 - 代码已使用 `gofmt` 整理；后续如需格式化，可执行 `/usr/local/go/bin/gofmt -w main.go`。
