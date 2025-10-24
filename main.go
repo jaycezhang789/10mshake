@@ -1159,24 +1159,27 @@ func parseStringFloat(v interface{}) float64 {
 }
 
 type config struct {
-	concurrency    int
-	top            int
-	updateInterval time.Duration
-	volumeRefresh  time.Duration
-	telegramToken  string
-	telegramChatID string
-	watchCount     int
-	emaFastPeriod  int
-	emaSlowPeriod  int
-	adxPeriod      int
-	adxThreshold   float64
-	autoTrade      bool
-	orderQty       float64
-	maxPositions   int
-	leverage       int
-	recvWindow     int
-	apiKey         string
-	apiSecret      string
+	concurrency      int
+	top              int
+	updateInterval   time.Duration
+	volumeRefresh    time.Duration
+	telegramToken    string
+	telegramChatID   string
+	watchCount       int
+	emaFastPeriod    int
+	emaSlowPeriod    int
+	macdFastPeriod   int
+	macdSlowPeriod   int
+	macdSignalPeriod int
+	adxPeriod        int
+	adxThreshold     float64
+	autoTrade        bool
+	orderQty         float64
+	maxPositions     int
+	leverage         int
+	recvWindow       int
+	apiKey           string
+	apiSecret        string
 }
 
 func main() {
@@ -1241,8 +1244,11 @@ func parseConfig() config {
 	updateInterval := flag.Duration("update-interval", 10*time.Minute, "涨跌幅更新周期")
 	volumeRefresh := flag.Duration("volume-refresh", 12*time.Hour, "成交量榜刷新周期")
 	watchCount := flag.Int("watch-count", 20, "监听币种数量")
-	emaFast := flag.Int("ema-fast", 12, "5m EMA 快速周期")
-	emaSlow := flag.Int("ema-slow", 26, "5m EMA 慢速周期")
+	emaFast := flag.Int("ema-fast", 7, "5m EMA 快速周期")
+	emaSlow := flag.Int("ema-slow", 25, "5m EMA 慢速周期")
+	macdFast := flag.Int("macd-fast", 12, "MACD 快速 EMA 周期")
+	macdSlow := flag.Int("macd-slow", 26, "MACD 慢速 EMA 周期")
+	macdSignal := flag.Int("macd-signal", 9, "MACD 信号线 EMA 周期")
 	adxPeriod := flag.Int("adx-period", 14, "5m ADX 周期")
 	adxThreshold := flag.Float64("adx-threshold", 25, "ADX 趋势判断阈值")
 	autoTrade := flag.Bool("auto-trade", true, "启用自动下单")
@@ -1262,24 +1268,27 @@ func parseConfig() config {
 	}
 
 	cfg := config{
-		concurrency:    *concurrency,
-		top:            *top,
-		updateInterval: *updateInterval,
-		volumeRefresh:  *volumeRefresh,
-		telegramToken:  os.Getenv("TELEGRAM_BOT_TOKEN"),
-		telegramChatID: os.Getenv("TELEGRAM_CHAT_ID"),
-		watchCount:     *watchCount,
-		emaFastPeriod:  *emaFast,
-		emaSlowPeriod:  *emaSlow,
-		adxPeriod:      *adxPeriod,
-		adxThreshold:   *adxThreshold,
-		autoTrade:      *autoTrade,
-		orderQty:       qty,
-		maxPositions:   *maxPositions,
-		leverage:       *leverage,
-		recvWindow:     *recvWindow,
-		apiKey:         os.Getenv("BINANCE_API_KEY"),
-		apiSecret:      os.Getenv("BINANCE_API_SECRET"),
+		concurrency:      *concurrency,
+		top:              *top,
+		updateInterval:   *updateInterval,
+		volumeRefresh:    *volumeRefresh,
+		telegramToken:    os.Getenv("TELEGRAM_BOT_TOKEN"),
+		telegramChatID:   os.Getenv("TELEGRAM_CHAT_ID"),
+		watchCount:       *watchCount,
+		emaFastPeriod:    *emaFast,
+		emaSlowPeriod:    *emaSlow,
+		macdFastPeriod:   *macdFast,
+		macdSlowPeriod:   *macdSlow,
+		macdSignalPeriod: *macdSignal,
+		adxPeriod:        *adxPeriod,
+		adxThreshold:     *adxThreshold,
+		autoTrade:        *autoTrade,
+		orderQty:         qty,
+		maxPositions:     *maxPositions,
+		leverage:         *leverage,
+		recvWindow:       *recvWindow,
+		apiKey:           os.Getenv("BINANCE_API_KEY"),
+		apiSecret:        os.Getenv("BINANCE_API_SECRET"),
 	}
 	if cfg.concurrency < 1 {
 		cfg.concurrency = 1
@@ -1304,6 +1313,15 @@ func parseConfig() config {
 	}
 	if cfg.emaSlowPeriod <= cfg.emaFastPeriod {
 		cfg.emaSlowPeriod = cfg.emaFastPeriod + 10
+	}
+	if cfg.macdFastPeriod < 1 {
+		cfg.macdFastPeriod = 12
+	}
+	if cfg.macdSlowPeriod <= cfg.macdFastPeriod {
+		cfg.macdSlowPeriod = cfg.macdFastPeriod + 14
+	}
+	if cfg.macdSignalPeriod < 1 {
+		cfg.macdSignalPeriod = 9
 	}
 	if cfg.adxPeriod < 1 {
 		cfg.adxPeriod = 14
@@ -1974,8 +1992,15 @@ func computeStrategyFromCandles(symbol string, candles []candle, cfg config) (st
 	result.Metrics = metrics
 
 	fiveMinute := aggregateTo5m(candles)
-	if len(fiveMinute) < cfg.emaSlowPeriod+1 {
-		return result, errors.New("5m K线不足以计算EMA")
+	required := cfg.emaSlowPeriod
+	if cfg.macdSlowPeriod > required {
+		required = cfg.macdSlowPeriod
+	}
+	if cfg.macdSignalPeriod > required {
+		required = cfg.macdSignalPeriod
+	}
+	if len(fiveMinute) < required+1 {
+		return result, errors.New("5m K线不足以计算EMA/MACD")
 	}
 	closes5m := make([]float64, 0, len(fiveMinute))
 	for _, cndl := range fiveMinute {
@@ -2000,10 +2025,27 @@ func computeStrategyFromCandles(symbol string, candles []candle, cfg config) (st
 	result.EMAFastSlope = fastCurrent - fastPrev
 	result.EMASlowSlope = slowCurrent - slowPrev
 
-	macdHist := fastCurrent - slowCurrent
-	macdPrev := fastPrev - slowPrev
+	macdFastSeries := emaSeries(closes5m, cfg.macdFastPeriod)
+	macdSlowSeries := emaSeries(closes5m, cfg.macdSlowPeriod)
+	if len(macdFastSeries) == 0 || len(macdSlowSeries) == 0 {
+		return result, errors.New("MACD EMA 数据不足")
+	}
+	macdLine := make([]float64, len(closes5m))
+	for i := range macdLine {
+		macdLine[i] = macdFastSeries[i] - macdSlowSeries[i]
+	}
+	macdSignalSeries := emaSeries(macdLine, cfg.macdSignalPeriod)
+	if len(macdSignalSeries) == 0 {
+		return result, errors.New("MACD 信号线数据不足")
+	}
+	macdCurrent := macdLine[lastIdx]
+	macdPrev := macdLine[lastIdx-1]
+	signalCurrent := macdSignalSeries[lastIdx]
+	signalPrev := macdSignalSeries[lastIdx-1]
+	macdHist := macdCurrent - signalCurrent
+	macdHistPrev := macdPrev - signalPrev
 	result.MACDHist = macdHist
-	result.MACDPrev = macdPrev
+	result.MACDPrev = macdHistPrev
 
 	adxVal, err := computeADX(fiveMinute, cfg.adxPeriod)
 	if err != nil {
@@ -2011,8 +2053,8 @@ func computeStrategyFromCandles(symbol string, candles []candle, cfg config) (st
 	}
 	result.ADX = adxVal
 
-	longSignal := fastCurrent > slowCurrent && result.EMAFastSlope > 0 && result.EMASlowSlope > 0 && macdHist > 0 && macdHist > macdPrev && adxVal > cfg.adxThreshold
-	shortSignal := fastCurrent < slowCurrent && result.EMAFastSlope < 0 && result.EMASlowSlope < 0 && macdHist < 0 && macdHist < macdPrev && adxVal > cfg.adxThreshold
+	longSignal := fastCurrent > slowCurrent && result.EMAFastSlope > 0 && result.EMASlowSlope > 0 && macdHist > 0 && macdHist > macdHistPrev && adxVal > cfg.adxThreshold
+	shortSignal := fastCurrent < slowCurrent && result.EMAFastSlope < 0 && result.EMASlowSlope < 0 && macdHist < 0 && macdHist < macdHistPrev && adxVal > cfg.adxThreshold
 	result.LongSignal = longSignal
 	result.ShortSignal = shortSignal
 	return result, nil
