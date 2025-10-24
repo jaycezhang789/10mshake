@@ -737,6 +737,28 @@ func (pm *positionManager) Replace(entries []positionEntry) {
 	}
 }
 
+func (pm *positionManager) Symbols() []string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if len(pm.positions) == 0 {
+		return nil
+	}
+	syms := make([]string, 0, len(pm.positions))
+	seen := make(map[string]struct{}, len(pm.positions))
+	for key := range pm.positions {
+		symbol := strings.ToUpper(key.Symbol)
+		if symbol == "" {
+			continue
+		}
+		if _, ok := seen[symbol]; ok {
+			continue
+		}
+		seen[symbol] = struct{}{}
+		syms = append(syms, symbol)
+	}
+	return syms
+}
+
 type tradeManager struct {
 	client     *binanceClient
 	positions  *positionManager
@@ -1303,6 +1325,27 @@ func run(cfg config) error {
 
 		gainers, losers := splitTopMovers(results, cfg.top)
 		watchSymbols := selectTopSymbols(results, cfg.watchCount)
+		watchSet := make(map[string]struct{}, len(watchSymbols))
+		for _, sym := range watchSymbols {
+			upper := strings.ToUpper(sym)
+			if upper == "" {
+				continue
+			}
+			watchSet[upper] = struct{}{}
+		}
+		if cfg.autoTrade && tradeMgr != nil {
+			for _, sym := range tradeMgr.positions.Symbols() {
+				upper := strings.ToUpper(sym)
+				if upper == "" {
+					continue
+				}
+				if _, ok := watchSet[upper]; ok {
+					continue
+				}
+				watchSymbols = append(watchSymbols, upper)
+				watchSet[upper] = struct{}{}
+			}
+		}
 		if len(watchSymbols) > 0 {
 			watchMgr.EnsureWatchers(ctx, watchSymbols)
 		}
@@ -1445,12 +1488,12 @@ func computeSymbolMetrics(ctx context.Context, c *http.Client, symbols []string,
 	}
 	wg.Wait()
 
-	// 按绝对涨跌幅降序
+	// 按绝对涨跌幅降序（基于 30 分钟涨跌幅）
 	sort.Slice(res, func(i, j int) bool {
-		ai := math.Abs(res[i].Change10m)
-		aj := math.Abs(res[j].Change10m)
+		ai := math.Abs(res[i].Change30m)
+		aj := math.Abs(res[j].Change30m)
 		if ai == aj {
-			return res[i].Change10m > res[j].Change10m
+			return res[i].Change30m > res[j].Change30m
 		}
 		return ai > aj
 	})
@@ -1462,14 +1505,14 @@ func splitTopMovers(results []symbolMetrics, top int) (gainers []symbolMetrics, 
 		top = 1
 	}
 	for _, r := range results {
-		if r.Change10m > 0 {
+		if r.Change30m > 0 {
 			gainers = append(gainers, r)
-		} else if r.Change10m < 0 {
+		} else if r.Change30m < 0 {
 			losers = append(losers, r)
 		}
 	}
-	sort.Slice(gainers, func(i, j int) bool { return gainers[i].Change10m > gainers[j].Change10m })
-	sort.Slice(losers, func(i, j int) bool { return losers[i].Change10m < losers[j].Change10m })
+	sort.Slice(gainers, func(i, j int) bool { return gainers[i].Change30m > gainers[j].Change30m })
+	sort.Slice(losers, func(i, j int) bool { return losers[i].Change30m < losers[j].Change30m })
 	if len(gainers) > top {
 		gainers = gainers[:top]
 	}
@@ -1512,7 +1555,7 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 	if len(watchSymbols) > 0 {
 		b.WriteString(fmt.Sprintf("当前监听币种(%d): %s\n", len(watchSymbols), strings.Join(watchSymbols, ", ")))
 	}
-	b.WriteString(fmt.Sprintf("10m 涨幅 Top%d:\n", top))
+	b.WriteString(fmt.Sprintf("30m 涨幅 Top%d:\n", top))
 	if len(gainers) == 0 {
 		b.WriteString("暂无涨幅数据\n")
 	} else {
@@ -1520,11 +1563,11 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 			b.WriteString(fmt.Sprintf("（仅 %d 个满足条件）\n", len(gainers)))
 		}
 		for i, g := range gainers {
-			b.WriteString(fmt.Sprintf("%2d) %-12s 10m:%+0.4f%% 30m:%+0.4f%% 1h:%+0.4f%% 2h:%+0.4f%% Avg振幅:%0.4f%% 收盘价: %.8f%s\n",
+			b.WriteString(fmt.Sprintf("%2d) %-12s 30m:%+0.4f%% 10m:%+0.4f%% 1h:%+0.4f%% 2h:%+0.4f%% Avg振幅:%0.4f%% 收盘价: %.8f%s\n",
 				i+1,
 				g.Symbol,
-				g.Change10m,
 				g.Change30m,
+				g.Change10m,
 				g.Change60m,
 				g.Change120m,
 				g.AvgAmplitude,
@@ -1534,7 +1577,7 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 		}
 	}
 	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("10m 跌幅 Top%d:\n", top))
+	b.WriteString(fmt.Sprintf("30m 跌幅 Top%d:\n", top))
 	if len(losers) == 0 {
 		b.WriteString("暂无跌幅数据\n")
 	} else {
@@ -1542,11 +1585,11 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 			b.WriteString(fmt.Sprintf("（仅 %d 个满足条件）\n", len(losers)))
 		}
 		for i, l := range losers {
-			b.WriteString(fmt.Sprintf("%2d) %-12s 10m:%+0.4f%% 30m:%+0.4f%% 1h:%+0.4f%% 2h:%+0.4f%% Avg振幅:%0.4f%% 收盘价: %.8f%s\n",
+			b.WriteString(fmt.Sprintf("%2d) %-12s 30m:%+0.4f%% 10m:%+0.4f%% 1h:%+0.4f%% 2h:%+0.4f%% Avg振幅:%0.4f%% 收盘价: %.8f%s\n",
 				i+1,
 				l.Symbol,
-				l.Change10m,
 				l.Change30m,
+				l.Change10m,
 				l.Change60m,
 				l.Change120m,
 				l.AvgAmplitude,
@@ -1569,10 +1612,11 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 			if sr.ShortSignal {
 				shortStatus = "S✅"
 			}
-			b.WriteString(fmt.Sprintf("%s/%s %-10s 10m:%+0.4f%% Avg振幅:%0.4f%% EMA快:%0.4f(Δ%0.4f) EMA慢:%0.4f(Δ%0.4f) MACD_H:%0.4f→%0.4f ADX:%0.2f%s\n",
+			b.WriteString(fmt.Sprintf("%s/%s %-10s 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% EMA快:%0.4f(Δ%0.4f) EMA慢:%0.4f(Δ%0.4f) MACD_H:%0.4f→%0.4f ADX:%0.2f%s\n",
 				longStatus,
 				shortStatus,
 				sr.Symbol,
+				sr.Metrics.Change30m,
 				sr.Metrics.Change10m,
 				sr.Metrics.AvgAmplitude,
 				sr.EMAFast,
@@ -1611,10 +1655,10 @@ func buildSignalAlerts(strategies []strategyResult, qtyMap map[string]float64) s
 		}
 		qtyInfo := formatQtyInfo(qtyMap, sr.Symbol)
 		if sr.LongSignal {
-			lines = append(lines, fmt.Sprintf("[开多] %s%s 10m:%+.4f%% MACD_H:%+.4f ADX:%.2f", sr.Symbol, qtyInfo, sr.Metrics.Change10m, sr.MACDHist, sr.ADX))
+			lines = append(lines, fmt.Sprintf("[开多] %s%s 30m:%+.4f%% 10m:%+.4f%% MACD_H:%+.4f ADX:%.2f", sr.Symbol, qtyInfo, sr.Metrics.Change30m, sr.Metrics.Change10m, sr.MACDHist, sr.ADX))
 		}
 		if sr.ShortSignal {
-			lines = append(lines, fmt.Sprintf("[开空] %s%s 10m:%+.4f%% MACD_H:%+.4f ADX:%.2f", sr.Symbol, qtyInfo, sr.Metrics.Change10m, sr.MACDHist, sr.ADX))
+			lines = append(lines, fmt.Sprintf("[开空] %s%s 30m:%+.4f%% 10m:%+.4f%% MACD_H:%+.4f ADX:%.2f", sr.Symbol, qtyInfo, sr.Metrics.Change30m, sr.Metrics.Change10m, sr.MACDHist, sr.ADX))
 		}
 	}
 	if len(lines) == 0 {
