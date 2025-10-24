@@ -614,7 +614,6 @@ type orderRequest struct {
 	Side         string
 	PositionSide string
 	Quantity     float64
-	ReduceOnly   bool
 }
 
 func (c *binanceClient) PlaceOrder(ctx context.Context, req orderRequest) error {
@@ -624,9 +623,6 @@ func (c *binanceClient) PlaceOrder(ctx context.Context, req orderRequest) error 
 	params.Set("type", "MARKET")
 	params.Set("quantity", formatQuantity(req.Quantity))
 	params.Set("positionSide", req.PositionSide)
-	if req.ReduceOnly {
-		params.Set("reduceOnly", "true")
-	}
 	_, err := c.signedRequest(ctx, http.MethodPost, "/fapi/v1/order", params)
 	return err
 }
@@ -742,17 +738,18 @@ func (pm *positionManager) Replace(entries []positionEntry) {
 }
 
 type tradeManager struct {
-	client    *binanceClient
-	positions *positionManager
-	cfg       config
-	qtyMu     sync.RWMutex
-	qty       map[string]float64
+	client     *binanceClient
+	positions  *positionManager
+	cfg        config
+	qtyMu      sync.RWMutex
+	qty        map[string]float64
+	httpClient *http.Client
 }
 
-func newTradeManager(client *binanceClient, positions []positionEntry, cfg config) *tradeManager {
+func newTradeManager(client *binanceClient, positions []positionEntry, cfg config, httpClient *http.Client) *tradeManager {
 	pm := newPositionManager(cfg.maxPositions)
 	pm.Replace(positions)
-	return &tradeManager{client: client, positions: pm, cfg: cfg, qty: make(map[string]float64)}
+	return &tradeManager{client: client, positions: pm, cfg: cfg, qty: make(map[string]float64), httpClient: httpClient}
 }
 
 func (tm *tradeManager) refreshPositions(ctx context.Context) error {
@@ -768,12 +765,19 @@ func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategy
 	if err := tm.refreshPositions(ctx); err != nil {
 		log.Printf("刷新持仓失败: %v", err)
 	}
-	tm.precomputeQuantities(ctx, strategies)
+	if len(strategies) > 0 {
+		metrics := make([]symbolMetrics, 0, len(strategies))
+		for _, sr := range strategies {
+			metrics = append(metrics, sr.Metrics)
+		}
+		tm.UpdateQuantitiesFromMetrics(ctx, metrics)
+	}
 	for _, sr := range strategies {
 		if tm.positions.Has(sr.Symbol, "LONG") {
 			if sr.EMAFast <= sr.EMASlow || sr.MACDHist <= 0 {
 				if err := tm.closePosition(ctx, sr.Symbol, "LONG"); err != nil {
 					log.Printf("平多单失败 %s: %v", sr.Symbol, err)
+					tm.notifyError(ctx, fmt.Sprintf("平多失败 %s: %v", sr.Symbol, err))
 				}
 			}
 		}
@@ -781,6 +785,7 @@ func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategy
 			if sr.EMAFast >= sr.EMASlow || sr.MACDHist >= 0 {
 				if err := tm.closePosition(ctx, sr.Symbol, "SHORT"); err != nil {
 					log.Printf("平空单失败 %s: %v", sr.Symbol, err)
+					tm.notifyError(ctx, fmt.Sprintf("平空失败 %s: %v", sr.Symbol, err))
 				}
 			}
 		}
@@ -797,6 +802,7 @@ func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategy
 		if sr.LongSignal && !tm.positions.Has(sr.Symbol, "LONG") {
 			if err := tm.openPosition(ctx, sr.Symbol, "LONG", price); err != nil {
 				log.Printf("开多单失败 %s: %v", sr.Symbol, err)
+				tm.notifyError(ctx, fmt.Sprintf("开多失败 %s: %v", sr.Symbol, err))
 			}
 		}
 		if tm.positions.Remaining() <= 0 {
@@ -805,6 +811,7 @@ func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategy
 		if sr.ShortSignal && !tm.positions.Has(sr.Symbol, "SHORT") {
 			if err := tm.openPosition(ctx, sr.Symbol, "SHORT", price); err != nil {
 				log.Printf("开空单失败 %s: %v", sr.Symbol, err)
+				tm.notifyError(ctx, fmt.Sprintf("开空失败 %s: %v", sr.Symbol, err))
 			}
 		}
 	}
@@ -824,7 +831,6 @@ func (tm *tradeManager) openPosition(ctx context.Context, symbol, side string, p
 	order := orderRequest{
 		Symbol:       symbol,
 		Quantity:     qty,
-		ReduceOnly:   false,
 		PositionSide: side,
 	}
 	switch side {
@@ -835,6 +841,7 @@ func (tm *tradeManager) openPosition(ctx context.Context, symbol, side string, p
 	default:
 		return fmt.Errorf("未知的持仓方向: %s", side)
 	}
+	log.Printf("下单请求: %s %s 数量 %s", symbol, side, formatQuantity(qty))
 	if err := tm.client.PlaceOrder(ctx, order); err != nil {
 		return err
 	}
@@ -872,16 +879,29 @@ func (tm *tradeManager) determineOpenQuantity(ctx context.Context, symbol string
 	return tm.client.AdjustQuantity(ctx, symbol, qty)
 }
 
-func (tm *tradeManager) precomputeQuantities(ctx context.Context, strategies []strategyResult) {
+func (tm *tradeManager) notifyError(ctx context.Context, msg string) {
+	if tm.httpClient == nil || msg == "" {
+		return
+	}
+	if tm.cfg.telegramToken == "" || tm.cfg.telegramChatID == "" {
+		return
+	}
+	text := "交易错误: " + msg
+	if err := sendTelegramMessages(ctx, tm.httpClient, tm.cfg.telegramToken, tm.cfg.telegramChatID, text); err != nil {
+		log.Printf("发送交易错误提醒失败: %v", err)
+	}
+}
+
+func (tm *tradeManager) UpdateQuantitiesFromMetrics(ctx context.Context, metrics []symbolMetrics) map[string]float64 {
 	tm.qtyMu.Lock()
 	tm.qty = make(map[string]float64)
 	tm.qtyMu.Unlock()
-	if len(strategies) == 0 {
-		return
+	if len(metrics) == 0 {
+		return nil
 	}
 	remaining := tm.positions.Remaining()
 	if remaining <= 0 {
-		return
+		return tm.snapshotQuantities()
 	}
 	var available float64
 	var availErr error
@@ -889,35 +909,36 @@ func (tm *tradeManager) precomputeQuantities(ctx context.Context, strategies []s
 		available, availErr = tm.client.FetchAvailableBalance(ctx)
 		if availErr != nil {
 			log.Printf("获取账户余额失败: %v", availErr)
-			return
+			return tm.snapshotQuantities()
 		}
 		if available <= 0 {
 			log.Printf("账户可用余额不足，无法计算下单数量")
-			return
+			return tm.snapshotQuantities()
 		}
 	}
-	for _, sr := range strategies {
-		price := sr.Metrics.Last
+	for _, m := range metrics {
+		price := m.Last
 		if price <= 0 {
 			continue
 		}
 		var qty float64
 		var err error
 		if tm.cfg.orderQty > 0 {
-			qty, err = tm.client.AdjustQuantity(ctx, sr.Symbol, tm.cfg.orderQty)
+			qty, err = tm.client.AdjustQuantity(ctx, m.Symbol, tm.cfg.orderQty)
 		} else {
 			notionalPerPosition := (available * float64(tm.cfg.leverage)) / float64(remaining)
 			if notionalPerPosition <= 0 {
 				continue
 			}
 			quantity := notionalPerPosition / price
-			qty, err = tm.client.AdjustQuantity(ctx, sr.Symbol, quantity)
+			qty, err = tm.client.AdjustQuantity(ctx, m.Symbol, quantity)
 		}
 		if err != nil || qty <= 0 {
 			continue
 		}
-		tm.setCachedQty(sr.Symbol, qty)
+		tm.setCachedQty(m.Symbol, qty)
 	}
+	return tm.snapshotQuantities()
 }
 
 func (tm *tradeManager) setCachedQty(symbol string, qty float64) {
@@ -958,7 +979,6 @@ func (tm *tradeManager) closePosition(ctx context.Context, symbol, side string) 
 	order := orderRequest{
 		Symbol:       symbol,
 		Quantity:     adjQty,
-		ReduceOnly:   true,
 		PositionSide: side,
 	}
 	switch side {
@@ -969,6 +989,7 @@ func (tm *tradeManager) closePosition(ctx context.Context, symbol, side string) 
 	default:
 		return fmt.Errorf("未知的持仓方向: %s", side)
 	}
+	log.Printf("平仓请求: %s %s 数量 %s", symbol, side, formatQuantity(adjQty))
 	if err := tm.client.PlaceOrder(ctx, order); err != nil {
 		return err
 	}
@@ -1122,7 +1143,7 @@ func parseConfig() config {
 	emaSlow := flag.Int("ema-slow", 26, "5m EMA 慢速周期")
 	adxPeriod := flag.Int("adx-period", 14, "5m ADX 周期")
 	adxThreshold := flag.Float64("adx-threshold", 25, "ADX 趋势判断阈值")
-	autoTrade := flag.Bool("auto-trade", false, "启用自动下单")
+	autoTrade := flag.Bool("auto-trade", true, "启用自动下单")
 	orderQty := flag.Float64("order-qty", 0, "每次下单的合约张数/数量")
 	maxPositions := flag.Int("max-positions", 5, "最大持仓数量")
 	leverage := flag.Int("leverage", 5, "杠杆倍数")
@@ -1208,9 +1229,6 @@ func run(cfg config) error {
 		if cfg.apiKey == "" || cfg.apiSecret == "" {
 			return errors.New("启用自动下单需要配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
 		}
-		if cfg.orderQty <= 0 {
-			return errors.New("启用自动下单需要通过 -order-qty 或 BINANCE_ORDER_QTY 设置正数数量")
-		}
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -1230,7 +1248,7 @@ func run(cfg config) error {
 		if err != nil {
 			return fmt.Errorf("获取当前持仓失败: %w", err)
 		}
-		tradeMgr = newTradeManager(binance, positions, cfg)
+		tradeMgr = newTradeManager(binance, positions, cfg, httpClient)
 		log.Printf("当前持仓数量: %d / %d", tradeMgr.positions.Count(), cfg.maxPositions)
 	}
 
@@ -1291,6 +1309,9 @@ func run(cfg config) error {
 		strategies := watchMgr.EvaluateStrategies(watchSymbols)
 		var qtyMap map[string]float64
 		if cfg.autoTrade && tradeMgr != nil {
+			qtyMap = tradeMgr.UpdateQuantitiesFromMetrics(ctxUpdate, results)
+		}
+		if cfg.autoTrade && tradeMgr != nil {
 			tradeMgr.HandleSignals(ctxUpdate, strategies)
 			qtyMap = tradeMgr.snapshotQuantities()
 		}
@@ -1299,8 +1320,13 @@ func run(cfg config) error {
 			return errors.New("推送内容为空")
 		}
 
-		if err := sendTelegramMessage(ctxUpdate, httpClient, cfg.telegramToken, cfg.telegramChatID, message); err != nil {
+		if err := sendTelegramMessages(ctxUpdate, httpClient, cfg.telegramToken, cfg.telegramChatID, message); err != nil {
 			return fmt.Errorf("发送Telegram消息失败: %w", err)
+		}
+		if alerts := buildSignalAlerts(strategies, qtyMap); len(alerts) > 0 {
+			if err := sendTelegramMessages(ctxUpdate, httpClient, cfg.telegramToken, cfg.telegramChatID, alerts); err != nil {
+				log.Printf("发送信号提醒失败: %v", err)
+			}
 		}
 		log.Printf("已推送Telegram通知，涨幅榜: %d 条，跌幅榜: %d 条，监听币种: %d", len(gainers), len(losers), len(watchSymbols))
 		return nil
@@ -1572,6 +1598,56 @@ func formatQtyInfo(qtyMap map[string]float64, symbol string) string {
 		return ""
 	}
 	return fmt.Sprintf(" Qty:%s", formatQuantity(q))
+}
+
+func buildSignalAlerts(strategies []strategyResult, qtyMap map[string]float64) string {
+	if len(strategies) == 0 {
+		return ""
+	}
+	var lines []string
+	for _, sr := range strategies {
+		if !sr.LongSignal && !sr.ShortSignal {
+			continue
+		}
+		qtyInfo := formatQtyInfo(qtyMap, sr.Symbol)
+		if sr.LongSignal {
+			lines = append(lines, fmt.Sprintf("[开多] %s%s 10m:%+.4f%% MACD_H:%+.4f ADX:%.2f", sr.Symbol, qtyInfo, sr.Metrics.Change10m, sr.MACDHist, sr.ADX))
+		}
+		if sr.ShortSignal {
+			lines = append(lines, fmt.Sprintf("[开空] %s%s 10m:%+.4f%% MACD_H:%+.4f ADX:%.2f", sr.Symbol, qtyInfo, sr.Metrics.Change10m, sr.MACDHist, sr.ADX))
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "信号提醒:\n" + strings.Join(lines, "\n")
+}
+
+func sendTelegramMessages(ctx context.Context, c *http.Client, token, chatID, text string) error {
+	const maxChunkRunes = 3500
+	runes := []rune(text)
+	for len(runes) > 0 {
+		chunkLen := len(runes)
+		if chunkLen > maxChunkRunes {
+			chunkLen = maxChunkRunes
+			// 尽量在换行处分割，避免拆断内容
+			for chunkLen > 0 && runes[chunkLen-1] != '\n' {
+				chunkLen--
+			}
+			if chunkLen == 0 {
+				chunkLen = maxChunkRunes
+			}
+		}
+		chunk := strings.TrimSpace(string(runes[:chunkLen]))
+		if err := sendTelegramMessage(ctx, c, token, chatID, chunk); err != nil {
+			return err
+		}
+		runes = runes[chunkLen:]
+		for len(runes) > 0 && runes[0] == '\n' {
+			runes = runes[1:]
+		}
+	}
+	return nil
 }
 
 func sendTelegramMessage(ctx context.Context, c *http.Client, token, chatID, text string) error {
