@@ -759,6 +759,19 @@ func (pm *positionManager) Symbols() []string {
 	return syms
 }
 
+func (pm *positionManager) Entries() []positionEntry {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if len(pm.positions) == 0 {
+		return nil
+	}
+	out := make([]positionEntry, 0, len(pm.positions))
+	for _, entry := range pm.positions {
+		out = append(out, entry)
+	}
+	return out
+}
+
 type tradeManager struct {
 	client     *binanceClient
 	positions  *positionManager
@@ -1375,6 +1388,50 @@ func run(cfg config) error {
 		return nil
 	}
 
+	positionStatus := func(parent context.Context) error {
+		if tradeMgr == nil {
+			return nil
+		}
+		ctxStatus, cancel := context.WithTimeout(parent, 90*time.Second)
+		defer cancel()
+
+		if err := tradeMgr.refreshPositions(ctxStatus); err != nil {
+			log.Printf("刷新持仓失败: %v", err)
+		}
+		entries := tradeMgr.positions.Entries()
+		symbolSet := make(map[string]struct{})
+		symbols := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			symbol := strings.ToUpper(entry.Symbol)
+			if symbol == "" {
+				continue
+			}
+			if _, exists := symbolSet[symbol]; exists {
+				continue
+			}
+			symbolSet[symbol] = struct{}{}
+			symbols = append(symbols, symbol)
+		}
+		if len(symbols) > 0 {
+			watchMgr.EnsureWatchers(parent, symbols)
+		}
+		strategyMap := make(map[string]strategyResult, len(symbols))
+		if len(symbols) > 0 {
+			for _, sr := range watchMgr.EvaluateStrategies(symbols) {
+				strategyMap[strings.ToUpper(sr.Symbol)] = sr
+			}
+		}
+		message := buildPositionStatusMessage(time.Now(), entries, strategyMap)
+		if message == "" {
+			return nil
+		}
+		if err := sendTelegramMessages(ctxStatus, httpClient, cfg.telegramToken, cfg.telegramChatID, message); err != nil {
+			return fmt.Errorf("发送持仓状态失败: %w", err)
+		}
+		log.Printf("已推送持仓状态，持仓数: %d", len(entries))
+		return nil
+	}
+
 	if err := refreshVolumeList(ctx); err != nil {
 		return err
 	}
@@ -1387,6 +1444,8 @@ func run(cfg config) error {
 	defer volumeTicker.Stop()
 	updateTicker := time.NewTicker(cfg.updateInterval)
 	defer updateTicker.Stop()
+	positionTicker := time.NewTicker(6 * time.Minute)
+	defer positionTicker.Stop()
 
 	log.Printf("启动完成：成交量刷新周期 %s，涨跌幅推送周期 %s", cfg.volumeRefresh, cfg.updateInterval)
 
@@ -1402,6 +1461,10 @@ func run(cfg config) error {
 		case <-updateTicker.C:
 			if err := computeAndNotify(ctx); err != nil {
 				log.Printf("推送Telegram失败: %v", err)
+			}
+		case <-positionTicker.C:
+			if err := positionStatus(ctx); err != nil {
+				log.Printf("推送持仓状态失败: %v", err)
 			}
 		}
 	}
@@ -1665,6 +1728,62 @@ func buildSignalAlerts(strategies []strategyResult, qtyMap map[string]float64) s
 		return ""
 	}
 	return "信号提醒:\n" + strings.Join(lines, "\n")
+}
+
+func buildPositionStatusMessage(now time.Time, entries []positionEntry, srMap map[string]strategyResult) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("持仓监控（6m）\n时间: %s\n", now.Format("2006-01-02 15:04:05")))
+	if len(entries) == 0 {
+		b.WriteString("当前无持仓")
+		return strings.TrimSpace(b.String())
+	}
+	b.WriteString(fmt.Sprintf("当前持仓数: %d\n", len(entries)))
+
+	sorted := append([]positionEntry(nil), entries...)
+	sort.Slice(sorted, func(i, j int) bool {
+		si := strings.ToUpper(sorted[i].Symbol)
+		sj := strings.ToUpper(sorted[j].Symbol)
+		if si == sj {
+			return sorted[i].Side < sorted[j].Side
+		}
+		return si < sj
+	})
+
+	for _, entry := range sorted {
+		symbol := strings.ToUpper(entry.Symbol)
+		qtyText := formatQuantity(entry.Qty)
+		if sr, ok := srMap[symbol]; ok {
+			longStatus := "L❌"
+			if sr.LongSignal {
+				longStatus = "L✅"
+			}
+			shortStatus := "S❌"
+			if sr.ShortSignal {
+				shortStatus = "S✅"
+			}
+			b.WriteString(fmt.Sprintf(
+				"%-12s %-5s Qty:%s %s/%s Last:%0.6f EMA快:%0.4f(Δ%+0.4f) EMA慢:%0.4f(Δ%+0.4f) MACD_H:%+0.4f→%+0.4f ADX:%0.2f 30m:%+0.2f%% 10m:%+0.2f%%\n",
+				symbol,
+				entry.Side,
+				qtyText,
+				longStatus,
+				shortStatus,
+				sr.Metrics.Last,
+				sr.EMAFast,
+				sr.EMAFastSlope,
+				sr.EMASlow,
+				sr.EMASlowSlope,
+				sr.MACDHist,
+				sr.MACDPrev,
+				sr.ADX,
+				sr.Metrics.Change30m,
+				sr.Metrics.Change10m,
+			))
+		} else {
+			b.WriteString(fmt.Sprintf("%-12s %-5s Qty:%s 指标数据不足，等待最新K线\n", symbol, entry.Side, qtyText))
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func sendTelegramMessages(ctx context.Context, c *http.Client, token, chatID, text string) error {
