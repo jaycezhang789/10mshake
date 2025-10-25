@@ -38,7 +38,7 @@ go build -o 10mshake
 - `-adx-period` 5m ADX 计算周期，默认 14。
 - `-adx-threshold` ADX 趋势强度阈值，默认 25。
 - `-auto-trade` 启用自动下单逻辑，默认开启（如需仅观察行情，可传 `-auto-trade=false`）。
-- `-order-qty` 每笔下单数量（或设置 `BINANCE_ORDER_QTY` 环境变量），默认 0（自动以可用余额的 1/10 作为保证金，并乘以杠杆换算名义价值）。
+- `-order-qty` 每笔下单数量（或设置 `BINANCE_ORDER_QTY` 环境变量），默认 0（自动以账户总余额的 1/10 作为保证金，并乘以杠杆换算名义价值）。
 - `-max-positions` 最大持仓数量，默认 10。
 - `-leverage` 杠杆倍数，默认 5。
 - `-recv-window` Binance API 请求 recvWindow，默认 5000ms。
@@ -71,7 +71,7 @@ go run . -concurrency 8 -top 15 -update-interval 5m -volume-refresh 6h
 ## 自动下单说明
 
 - 通过 `-auto-trade` 开启真实交易；需在 `.env` 或环境变量中配置 `BINANCE_API_KEY`、`BINANCE_API_SECRET`。
-- 每笔下单数量可通过 `-order-qty` 或 `BINANCE_ORDER_QTY` 指定；若留空则自动取当前可用余额的 1/10 作为保证金，结合杠杆换算名义价值，再除以最新价得到合约张数（同时在行情推送中展示候选数量）。程序默认使用全仓、双向持仓，并自动设置 5 倍杠杆（可调）。
+- 每笔下单数量可通过 `-order-qty` 或 `BINANCE_ORDER_QTY` 指定；若留空则自动取账户总余额的 1/10 作为保证金，结合杠杆换算名义价值，再除以最新价得到合约张数（同时在行情推送中展示候选数量）。程序默认使用全仓、双向持仓，并自动设置 5 倍杠杆（可调）。
 - 依据策略：
   - 开多：`EMA_fast > EMA_slow` 且快慢线斜率向上，`MACD_H>0` 且放大（较上一棒增加），`ADX>阈值`。
   - 平多：`EMA_fast <= EMA_slow` 或 `MACD_H <= 0`。

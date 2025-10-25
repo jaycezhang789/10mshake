@@ -476,18 +476,18 @@ func (c *binanceClient) EnsureDualSide(ctx context.Context) error {
 	return nil
 }
 
-func (c *binanceClient) FetchAvailableBalance(ctx context.Context) (float64, error) {
+func (c *binanceClient) FetchWalletBalance(ctx context.Context) (float64, error) {
 	body, err := c.signedRequest(ctx, http.MethodGet, "/fapi/v2/account", nil)
 	if err != nil {
 		return 0, err
 	}
 	var payload struct {
-		AvailableBalance string `json:"availableBalance"`
+		TotalWalletBalance string `json:"totalWalletBalance"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return 0, err
 	}
-	bal, err := strconv.ParseFloat(payload.AvailableBalance, 64)
+	bal, err := strconv.ParseFloat(payload.TotalWalletBalance, 64)
 	if err != nil {
 		return 0, err
 	}
@@ -962,14 +962,14 @@ func (tm *tradeManager) determineOpenQuantity(ctx context.Context, symbol string
 	if tm.cfg.orderQty > 0 {
 		return tm.client.AdjustQuantity(ctx, symbol, tm.cfg.orderQty)
 	}
-	available, err := tm.client.FetchAvailableBalance(ctx)
+	walletBalance, err := tm.client.FetchWalletBalance(ctx)
 	if err != nil {
 		return 0, err
 	}
-	if available <= 0 {
-		return 0, fmt.Errorf("可用余额不足")
+	if walletBalance <= 0 {
+		return 0, fmt.Errorf("账户余额不足")
 	}
-	margin := available / 10.0
+	margin := walletBalance / 10.0
 	if margin <= 0 {
 		return 0, fmt.Errorf("无有效名义资金")
 	}
@@ -1005,24 +1005,24 @@ func (tm *tradeManager) UpdateQuantitiesFromMetrics(ctx context.Context, metrics
 	if remaining <= 0 {
 		return tm.snapshotQuantities()
 	}
-	var available float64
+	var walletBalance float64
 	var availErr error
 	if tm.cfg.orderQty <= 0 {
-		available, availErr = tm.client.FetchAvailableBalance(ctx)
+		walletBalance, availErr = tm.client.FetchWalletBalance(ctx)
 		if availErr != nil {
 			log.Printf("获取账户余额失败: %v", availErr)
 			return tm.snapshotQuantities()
 		}
-		if available <= 0 {
-			log.Printf("账户可用余额不足，无法计算下单数量")
+		if walletBalance <= 0 {
+			log.Printf("账户余额不足，无法计算下单数量")
 			return tm.snapshotQuantities()
 		}
 	}
 	margin := 0.0
 	if tm.cfg.orderQty <= 0 {
-		margin = available / 10.0
+		margin = walletBalance / 10.0
 		if margin <= 0 {
-			log.Printf("账户可用余额不足，无法根据 1/10 规则计算下单数量")
+			log.Printf("账户余额不足，无法根据 1/10 规则计算下单数量")
 			return tm.snapshotQuantities()
 		}
 	}
