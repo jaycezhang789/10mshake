@@ -36,7 +36,7 @@ const (
 )
 
 const (
-	initialKlineLimit  = 1500
+	initialKlineLimit  = 499
 	positionKlineLimit = 499
 	max1mCandles       = 2000
 )
