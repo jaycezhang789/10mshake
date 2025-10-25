@@ -962,10 +962,6 @@ func (tm *tradeManager) determineOpenQuantity(ctx context.Context, symbol string
 	if tm.cfg.orderQty > 0 {
 		return tm.client.AdjustQuantity(ctx, symbol, tm.cfg.orderQty)
 	}
-	remaining := tm.positions.Remaining()
-	if remaining <= 0 {
-		return 0, fmt.Errorf("无可用仓位")
-	}
 	available, err := tm.client.FetchAvailableBalance(ctx)
 	if err != nil {
 		return 0, err
@@ -973,11 +969,15 @@ func (tm *tradeManager) determineOpenQuantity(ctx context.Context, symbol string
 	if available <= 0 {
 		return 0, fmt.Errorf("可用余额不足")
 	}
-	notionalPerPosition := (available * float64(tm.cfg.leverage)) / float64(remaining)
-	if notionalPerPosition <= 0 {
+	margin := available / 10.0
+	if margin <= 0 {
 		return 0, fmt.Errorf("无有效名义资金")
 	}
-	qty := notionalPerPosition / price
+	notional := margin * float64(tm.cfg.leverage)
+	if notional <= 0 {
+		return 0, fmt.Errorf("无有效名义资金")
+	}
+	qty := notional / price
 	return tm.client.AdjustQuantity(ctx, symbol, qty)
 }
 
@@ -1018,6 +1018,14 @@ func (tm *tradeManager) UpdateQuantitiesFromMetrics(ctx context.Context, metrics
 			return tm.snapshotQuantities()
 		}
 	}
+	margin := 0.0
+	if tm.cfg.orderQty <= 0 {
+		margin = available / 10.0
+		if margin <= 0 {
+			log.Printf("账户可用余额不足，无法根据 1/10 规则计算下单数量")
+			return tm.snapshotQuantities()
+		}
+	}
 	for _, m := range metrics {
 		price := m.Last
 		if price <= 0 {
@@ -1028,11 +1036,11 @@ func (tm *tradeManager) UpdateQuantitiesFromMetrics(ctx context.Context, metrics
 		if tm.cfg.orderQty > 0 {
 			qty, err = tm.client.AdjustQuantity(ctx, m.Symbol, tm.cfg.orderQty)
 		} else {
-			notionalPerPosition := (available * float64(tm.cfg.leverage)) / float64(remaining)
-			if notionalPerPosition <= 0 {
+			notional := margin * float64(tm.cfg.leverage)
+			if notional <= 0 {
 				continue
 			}
-			quantity := notionalPerPosition / price
+			quantity := notional / price
 			qty, err = tm.client.AdjustQuantity(ctx, m.Symbol, quantity)
 		}
 		if err != nil || qty <= 0 {
@@ -1240,7 +1248,7 @@ func loadEnvFile(path string) error {
 
 func parseConfig() config {
 	concurrency := flag.Int("concurrency", 10, "并发请求数量")
-	top := flag.Int("top", 10, "输出涨跌幅排名数量")
+	top := flag.Int("top", 20, "输出涨跌幅排名数量")
 	updateInterval := flag.Duration("update-interval", 10*time.Minute, "涨跌幅更新周期")
 	volumeRefresh := flag.Duration("volume-refresh", 12*time.Hour, "成交量榜刷新周期")
 	watchCount := flag.Int("watch-count", 20, "监听币种数量")
@@ -1253,7 +1261,7 @@ func parseConfig() config {
 	adxThreshold := flag.Float64("adx-threshold", 25, "ADX 趋势判断阈值")
 	autoTrade := flag.Bool("auto-trade", true, "启用自动下单")
 	orderQty := flag.Float64("order-qty", 0, "每次下单的合约张数/数量")
-	maxPositions := flag.Int("max-positions", 5, "最大持仓数量")
+	maxPositions := flag.Int("max-positions", 10, "最大持仓数量")
 	leverage := flag.Int("leverage", 5, "杠杆倍数")
 	recvWindow := flag.Int("recv-window", 5000, "Binance API recvWindow (毫秒)")
 	flag.Parse()
@@ -1309,10 +1317,10 @@ func parseConfig() config {
 		cfg.watchCount = cfg.top
 	}
 	if cfg.emaFastPeriod < 1 {
-		cfg.emaFastPeriod = 12
+		cfg.emaFastPeriod = 7
 	}
 	if cfg.emaSlowPeriod <= cfg.emaFastPeriod {
-		cfg.emaSlowPeriod = cfg.emaFastPeriod + 10
+		cfg.emaSlowPeriod = cfg.emaFastPeriod + 18
 	}
 	if cfg.macdFastPeriod < 1 {
 		cfg.macdFastPeriod = 12
@@ -1330,7 +1338,7 @@ func parseConfig() config {
 		cfg.adxThreshold = 25
 	}
 	if cfg.maxPositions < 1 {
-		cfg.maxPositions = 5
+		cfg.maxPositions = 10
 	}
 	if cfg.leverage < 1 {
 		cfg.leverage = 5
