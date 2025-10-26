@@ -2405,7 +2405,7 @@ func (tm *tradeManager) determineOpenQuantity(ctx context.Context, symbol string
 	if walletBalance <= 0 {
 		return 0, fmt.Errorf("账户余额不足")
 	}
-	margin := walletBalance / 10.0
+	margin := walletBalance / 3.0
 	if margin <= 0 {
 		return 0, fmt.Errorf("无有效名义资金")
 	}
@@ -2417,17 +2417,11 @@ func (tm *tradeManager) determineOpenQuantity(ctx context.Context, symbol string
 	return tm.client.AdjustQuantity(ctx, symbol, qty)
 }
 
-func (tm *tradeManager) notifyError(ctx context.Context, msg string) {
-	if tm.httpClient == nil || msg == "" {
+func (tm *tradeManager) notifyError(_ context.Context, msg string) {
+	if msg == "" {
 		return
 	}
-	if tm.cfg.telegramToken == "" || tm.cfg.telegramChatID == "" {
-		return
-	}
-	text := "交易错误: " + msg
-	if err := sendTelegramMessages(ctx, tm.httpClient, tm.cfg.telegramToken, tm.cfg.telegramChatID, text); err != nil {
-		log.Printf("发送交易错误提醒失败: %v", err)
-	}
+	log.Printf("交易错误: %s", msg)
 }
 
 func (tm *tradeManager) UpdateQuantitiesFromMetrics(ctx context.Context, metrics []symbolMetrics) map[string]float64 {
@@ -2609,12 +2603,8 @@ func parseStringFloat(v interface{}) float64 {
 
 type config struct {
 	concurrency           int
-	top                   int
 	updateInterval        time.Duration
 	volumeRefresh         time.Duration
-	telegramToken         string
-	telegramChatID        string
-	watchCount            int
 	emaFastPeriod         int
 	emaSlowPeriod         int
 	macdFastPeriod        int
@@ -2691,10 +2681,8 @@ func loadEnvFile(path string) error {
 
 func parseConfig() config {
 	concurrency := flag.Int("concurrency", 10, "并发请求数量")
-	top := flag.Int("top", 20, "输出涨跌幅排名数量")
 	updateInterval := flag.Duration("update-interval", 10*time.Minute, "涨跌幅更新周期")
 	volumeRefresh := flag.Duration("volume-refresh", 12*time.Hour, "成交量榜刷新周期")
-	watchCount := flag.Int("watch-count", 20, "监听币种数量")
 	emaFast := flag.Int("ema-fast", 7, "5m EMA 快速周期")
 	emaSlow := flag.Int("ema-slow", 25, "5m EMA 慢速周期")
 	macdFast := flag.Int("macd-fast", 12, "MACD 快速 EMA 周期")
@@ -2722,12 +2710,8 @@ func parseConfig() config {
 
 	cfg := config{
 		concurrency:           *concurrency,
-		top:                   *top,
 		updateInterval:        *updateInterval,
 		volumeRefresh:         *volumeRefresh,
-		telegramToken:         os.Getenv("TELEGRAM_BOT_TOKEN"),
-		telegramChatID:        os.Getenv("TELEGRAM_CHAT_ID"),
-		watchCount:            *watchCount,
 		emaFastPeriod:         *emaFast,
 		emaSlowPeriod:         *emaSlow,
 		macdFastPeriod:        *macdFast,
@@ -2748,20 +2732,11 @@ func parseConfig() config {
 	if cfg.concurrency < 1 {
 		cfg.concurrency = 1
 	}
-	if cfg.top < 1 {
-		cfg.top = 1
-	}
 	if cfg.updateInterval <= 0 {
 		cfg.updateInterval = 10 * time.Minute
 	}
 	if cfg.volumeRefresh <= 0 {
 		cfg.volumeRefresh = 12 * time.Hour
-	}
-	if cfg.watchCount < 1 {
-		cfg.watchCount = cfg.top
-	}
-	if cfg.watchCount < cfg.top {
-		cfg.watchCount = cfg.top
 	}
 	if cfg.emaFastPeriod < 1 {
 		cfg.emaFastPeriod = 7
@@ -2834,9 +2809,6 @@ func initializeExistingPositions(ctx context.Context, tradeMgr *tradeManager) {
 }
 
 func run(cfg config) error {
-	if cfg.telegramToken == "" || cfg.telegramChatID == "" {
-		return errors.New("未配置 Telegram 凭证：请在环境变量 TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID 中设置")
-	}
 	if cfg.autoTrade {
 		if cfg.apiKey == "" || cfg.apiSecret == "" {
 			return errors.New("启用自动下单需要配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
@@ -2899,7 +2871,7 @@ func run(cfg config) error {
 		return nil
 	}
 
-	computeAndNotify := func(parent context.Context) error {
+	computeAndEvaluate := func(parent context.Context) error {
 		symbolsMu.RLock()
 		snapshot := append([]string(nil), symbols...)
 		symbolsMu.RUnlock()
@@ -2915,7 +2887,6 @@ func run(cfg config) error {
 			return errors.New("未能计算任何交易对的10分钟涨跌幅")
 		}
 
-		gainers, losers := splitTopMovers(results, cfg.top)
 		watchSet := make(map[string]struct{}, len(snapshot))
 		for _, sym := range snapshot {
 			upper := strings.ToUpper(sym)
@@ -2944,32 +2915,15 @@ func run(cfg config) error {
 			watchMgr.EnsureWatchers(ctx, watchSymbols)
 		}
 		strategies := watchMgr.EvaluateStrategies(watchSymbols)
-		var qtyMap map[string]float64
 		if cfg.autoTrade && tradeMgr != nil {
-			qtyMap = tradeMgr.UpdateQuantitiesFromMetrics(ctxUpdate, results)
-		}
-		if cfg.autoTrade && tradeMgr != nil {
+			tradeMgr.UpdateQuantitiesFromMetrics(ctxUpdate, results)
 			tradeMgr.HandleSignals(ctxUpdate, strategies)
-			qtyMap = tradeMgr.snapshotQuantities()
 		}
-		message := buildTelegramMessage(time.Now(), len(snapshot), cfg.top, gainers, losers, strategies, watchSymbols, qtyMap)
-		if message == "" {
-			return errors.New("推送内容为空")
-		}
-
-		if err := sendTelegramMessages(ctxUpdate, httpClient, cfg.telegramToken, cfg.telegramChatID, message); err != nil {
-			return fmt.Errorf("发送Telegram消息失败: %w", err)
-		}
-		if alerts := buildSignalAlerts(strategies, qtyMap); len(alerts) > 0 {
-			if err := sendTelegramMessages(ctxUpdate, httpClient, cfg.telegramToken, cfg.telegramChatID, alerts); err != nil {
-				log.Printf("发送信号提醒失败: %v", err)
-			}
-		}
-		log.Printf("已推送Telegram通知，涨幅榜: %d 条，跌幅榜: %d 条，监听币种: %d", len(gainers), len(losers), len(watchSymbols))
+		log.Printf("完成行情评估，共评估 %d 个交易对，生成策略: %d 条", len(watchSymbols), len(strategies))
 		return nil
 	}
 
-	positionStatus := func(parent context.Context) error {
+	refreshPositionSnapshots := func(parent context.Context) error {
 		if tradeMgr == nil {
 			return nil
 		}
@@ -3007,14 +2961,7 @@ func run(cfg config) error {
 				strategyMap[strings.ToUpper(sr.Symbol)] = sr
 			}
 		}
-		message := buildPositionStatusMessage(time.Now(), entries, strategyMap)
-		if message == "" {
-			return nil
-		}
-		if err := sendTelegramMessages(ctxStatus, httpClient, cfg.telegramToken, cfg.telegramChatID, message); err != nil {
-			return fmt.Errorf("发送持仓状态失败: %w", err)
-		}
-		log.Printf("已推送持仓状态，持仓数: %d", len(entries))
+		log.Printf("已更新持仓快照，持仓数: %d", len(entries))
 		return nil
 	}
 
@@ -3022,8 +2969,8 @@ func run(cfg config) error {
 		return err
 	}
 
-	if err := computeAndNotify(ctx); err != nil {
-		log.Printf("首次推送失败: %v", err)
+	if err := computeAndEvaluate(ctx); err != nil {
+		log.Printf("首次行情评估失败: %v", err)
 	}
 
 	volumeTicker := time.NewTicker(cfg.volumeRefresh)
@@ -3033,7 +2980,7 @@ func run(cfg config) error {
 	positionTicker := time.NewTicker(6 * time.Minute)
 	defer positionTicker.Stop()
 
-	log.Printf("启动完成：成交量刷新周期 %s，涨跌幅推送周期 %s", cfg.volumeRefresh, cfg.updateInterval)
+	log.Printf("启动完成：成交量刷新周期 %s，指标评估周期 %s", cfg.volumeRefresh, cfg.updateInterval)
 
 	for {
 		select {
@@ -3045,12 +2992,12 @@ func run(cfg config) error {
 				log.Printf("刷新成交量列表失败: %v", err)
 			}
 		case <-updateTicker.C:
-			if err := computeAndNotify(ctx); err != nil {
-				log.Printf("推送Telegram失败: %v", err)
+			if err := computeAndEvaluate(ctx); err != nil {
+				log.Printf("行情评估失败: %v", err)
 			}
 		case <-positionTicker.C:
-			if err := positionStatus(ctx); err != nil {
-				log.Printf("推送持仓状态失败: %v", err)
+			if err := refreshPositionSnapshots(ctx); err != nil {
+				log.Printf("更新持仓快照失败: %v", err)
 			}
 		}
 	}
@@ -3147,305 +3094,6 @@ func computeSymbolMetrics(ctx context.Context, c *http.Client, symbols []string,
 		return ai > aj
 	})
 	return res
-}
-
-func splitTopMovers(results []symbolMetrics, top int) (gainers []symbolMetrics, losers []symbolMetrics) {
-	if top < 1 {
-		top = 1
-	}
-	for _, r := range results {
-		if r.Change30m > 0 {
-			gainers = append(gainers, r)
-		} else if r.Change30m < 0 {
-			losers = append(losers, r)
-		}
-	}
-	sort.Slice(gainers, func(i, j int) bool { return gainers[i].Change30m > gainers[j].Change30m })
-	sort.Slice(losers, func(i, j int) bool { return losers[i].Change30m < losers[j].Change30m })
-	if len(gainers) > top {
-		gainers = gainers[:top]
-	}
-	if len(losers) > top {
-		losers = losers[:top]
-	}
-	return gainers, losers
-}
-
-func selectTopSymbols(results []symbolMetrics, count int) []string {
-	if count <= 0 {
-		return nil
-	}
-	if len(results) < count {
-		count = len(results)
-	}
-	symbols := make([]string, 0, count)
-	seen := make(map[string]struct{}, count)
-	for _, r := range results {
-		sym := strings.ToUpper(r.Symbol)
-		if sym == "" {
-			continue
-		}
-		if _, ok := seen[sym]; ok {
-			continue
-		}
-		symbols = append(symbols, sym)
-		seen[sym] = struct{}{}
-		if len(symbols) >= count {
-			break
-		}
-	}
-	return symbols
-}
-
-func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, losers []symbolMetrics, strategies []strategyResult, watchSymbols []string, qtyMap map[string]float64) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("时间: %s\n", now.Format("2006-01-02 15:04:05")))
-	b.WriteString(fmt.Sprintf("成交量前50%%交易对数: %d\n", volumeCount))
-	if len(watchSymbols) > 0 {
-		b.WriteString(fmt.Sprintf("当前监听币种(%d): %s\n", len(watchSymbols), strings.Join(watchSymbols, ", ")))
-	}
-	b.WriteString("信号列表 (含环境过滤信息)：\n")
-	printed := false
-	for _, sr := range strategies {
-		if !sr.LongSignal && !sr.ShortSignal {
-			continue
-		}
-		status := ""
-		if sr.EntryBlocked && len(sr.BlockReasons) > 0 {
-			status = " BLOCK: " + strings.Join(sr.BlockReasons, "; ")
-		}
-		spreadInfo := fmt.Sprintf(" Spread/ATR:%0.3f Depth:%0.0f", sr.SpreadRatio, sr.DepthNotional)
-		qtyInfo := formatQtyInfo(qtyMap, sr.Symbol)
-		if sr.LongSignal {
-			printed = true
-			b.WriteString(fmt.Sprintf("[开多] %-10s Score:%0.2f 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s%s%s\n",
-				sr.Symbol,
-				sr.Score,
-				sr.Metrics.Change30m,
-				sr.Metrics.Change10m,
-				sr.Metrics.AvgAmplitude,
-				summarizeTimeframe(sr.FiveMinute),
-				summarizeTimeframe(sr.ThreeMinute),
-				spreadInfo,
-				qtyInfo,
-				status,
-			))
-		}
-		if sr.ShortSignal {
-			printed = true
-			b.WriteString(fmt.Sprintf("[开空] %-10s Score:%0.2f 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s%s%s\n",
-				sr.Symbol,
-				sr.Score,
-				sr.Metrics.Change30m,
-				sr.Metrics.Change10m,
-				sr.Metrics.AvgAmplitude,
-				summarizeTimeframe(sr.FiveMinute),
-				summarizeTimeframe(sr.ThreeMinute),
-				spreadInfo,
-				qtyInfo,
-				status,
-			))
-		}
-	}
-	if !printed {
-		b.WriteString("暂无可开仓信号\n")
-	}
-
-	b.WriteString(fmt.Sprintf("\n涨幅榜 (Top %d)：\n", top))
-	for i, g := range gainers {
-		if i >= top {
-			break
-		}
-		b.WriteString(fmt.Sprintf("%2d) %-12s 30m:%+0.4f%% 10m:%+0.4f%% 收盘价: %.8f\n", i+1, g.Symbol, g.Change30m, g.Change10m, g.Last))
-	}
-
-	b.WriteString(fmt.Sprintf("\n跌幅榜 (Top %d)：\n", top))
-	for i, l := range losers {
-		if i >= top {
-			break
-		}
-		b.WriteString(fmt.Sprintf("%2d) %-12s 30m:%+0.4f%% 10m:%+0.4f%% 收盘价: %.8f\n", i+1, l.Symbol, l.Change30m, l.Change10m, l.Last))
-	}
-
-	return strings.TrimSpace(b.String())
-}
-
-func formatQtyInfo(qtyMap map[string]float64, symbol string) string {
-	if qtyMap == nil {
-		return ""
-	}
-	q, ok := qtyMap[strings.ToUpper(symbol)]
-	if !ok || q <= 0 {
-		return ""
-	}
-	return fmt.Sprintf(" Qty:%s", formatQuantity(q))
-}
-
-func summarizeTimeframe(tf timeframeAnalysis) string {
-	return fmt.Sprintf("%s EMA快:%0.4f(Δ%+0.4f) EMA慢:%0.4f(Δ%+0.4f) MACD_H:%+0.4f→%+0.4f ADX:%0.2f",
-		tf.Interval,
-		tf.EMAFast,
-		tf.EMAFastSlope,
-		tf.EMASlow,
-		tf.EMASlowSlope,
-		tf.MACDHist,
-		tf.MACDPrev,
-		tf.ADX,
-	)
-}
-
-func buildSignalAlerts(strategies []strategyResult, qtyMap map[string]float64) string {
-	if len(strategies) == 0 {
-		return ""
-	}
-	var lines []string
-	for _, sr := range strategies {
-		if sr.EntryBlocked {
-			continue
-		}
-		if !sr.LongSignal && !sr.ShortSignal {
-			continue
-		}
-		qtyInfo := formatQtyInfo(qtyMap, sr.Symbol)
-		if sr.LongSignal {
-			lines = append(lines, fmt.Sprintf("[开多] %s%s Score:%0.2f 30m:%+.4f%% 10m:%+.4f%% Spread/ATR:%0.3f Depth:%0.0f 5m MACD_H:%+.4f ADX:%.2f | 3m MACD_H:%+.4f ADX:%.2f",
-				sr.Symbol,
-				qtyInfo,
-				sr.Score,
-				sr.Metrics.Change30m,
-				sr.Metrics.Change10m,
-				sr.SpreadRatio,
-				sr.DepthNotional,
-				sr.FiveMinute.MACDHist,
-				sr.FiveMinute.ADX,
-				sr.ThreeMinute.MACDHist,
-				sr.ThreeMinute.ADX,
-			))
-		}
-		if sr.ShortSignal {
-			lines = append(lines, fmt.Sprintf("[开空] %s%s Score:%0.2f 30m:%+.4f%% 10m:%+.4f%% Spread/ATR:%0.3f Depth:%0.0f 5m MACD_H:%+.4f ADX:%.2f | 3m MACD_H:%+.4f ADX:%.2f",
-				sr.Symbol,
-				qtyInfo,
-				sr.Score,
-				sr.Metrics.Change30m,
-				sr.Metrics.Change10m,
-				sr.SpreadRatio,
-				sr.DepthNotional,
-				sr.FiveMinute.MACDHist,
-				sr.FiveMinute.ADX,
-				sr.ThreeMinute.MACDHist,
-				sr.ThreeMinute.ADX,
-			))
-		}
-	}
-	if len(lines) == 0 {
-		return ""
-	}
-	return "信号提醒:\n" + strings.Join(lines, "\n")
-}
-
-func buildPositionStatusMessage(now time.Time, entries []positionEntry, srMap map[string]strategyResult) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("持仓监控（6m）\n时间: %s\n", now.Format("2006-01-02 15:04:05")))
-	if len(entries) == 0 {
-		b.WriteString("当前无持仓")
-		return strings.TrimSpace(b.String())
-	}
-	b.WriteString(fmt.Sprintf("当前持仓数: %d\n", len(entries)))
-
-	sorted := append([]positionEntry(nil), entries...)
-	sort.Slice(sorted, func(i, j int) bool {
-		si := strings.ToUpper(sorted[i].Symbol)
-		sj := strings.ToUpper(sorted[j].Symbol)
-		if si == sj {
-			return sorted[i].Side < sorted[j].Side
-		}
-		return si < sj
-	})
-
-	for _, entry := range sorted {
-		symbol := strings.ToUpper(entry.Symbol)
-		qtyText := formatQuantity(entry.Qty)
-		if sr, ok := srMap[symbol]; ok {
-			longStatus := "L❌"
-			if sr.LongSignal {
-				longStatus = "L✅"
-			}
-			shortStatus := "S❌"
-			if sr.ShortSignal {
-				shortStatus = "S✅"
-			}
-			b.WriteString(fmt.Sprintf(
-				"%-12s %-5s Qty:%s %s/%s Last:%0.6f Score:%0.2f | %s | %s 30m:%+0.2f%% 10m:%+0.2f%%\n",
-				symbol,
-				entry.Side,
-				qtyText,
-				longStatus,
-				shortStatus,
-				sr.Metrics.Last,
-				sr.Score,
-				summarizeTimeframe(sr.FiveMinute),
-				summarizeTimeframe(sr.ThreeMinute),
-				sr.Metrics.Change30m,
-				sr.Metrics.Change10m,
-			))
-		} else {
-			b.WriteString(fmt.Sprintf("%-12s %-5s Qty:%s 指标数据不足，等待最新K线\n", symbol, entry.Side, qtyText))
-		}
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func sendTelegramMessages(ctx context.Context, c *http.Client, token, chatID, text string) error {
-	const maxChunkRunes = 3500
-	runes := []rune(text)
-	for len(runes) > 0 {
-		chunkLen := len(runes)
-		if chunkLen > maxChunkRunes {
-			chunkLen = maxChunkRunes
-			// 尽量在换行处分割，避免拆断内容
-			for chunkLen > 0 && runes[chunkLen-1] != '\n' {
-				chunkLen--
-			}
-			if chunkLen == 0 {
-				chunkLen = maxChunkRunes
-			}
-		}
-		chunk := strings.TrimSpace(string(runes[:chunkLen]))
-		if err := sendTelegramMessage(ctx, c, token, chatID, chunk); err != nil {
-			return err
-		}
-		runes = runes[chunkLen:]
-		for len(runes) > 0 && runes[0] == '\n' {
-			runes = runes[1:]
-		}
-	}
-	return nil
-}
-
-func sendTelegramMessage(ctx context.Context, c *http.Client, token, chatID, text string) error {
-	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
-	form := url.Values{}
-	form.Set("chat_id", chatID)
-	form.Set("text", text)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := c.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("Telegram API 返回状态 %d: %s", resp.StatusCode, string(body))
-	}
-	return nil
 }
 
 func computeTimeframeAnalysis(interval string, candles []candle, cfg config) (timeframeAnalysis, error) {
