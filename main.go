@@ -2262,9 +2262,11 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 		return nil
 	}
 	if tm.positions.Remaining() <= 0 {
+		log.Printf("%s 未开仓：已达到最大持仓数量", symbol)
 		return nil
 	}
 	if tm.isCoolingDown(symbol) {
+		log.Printf("%s 未开仓：冷却中", symbol)
 		return nil
 	}
 	var sr strategyResult
@@ -2283,19 +2285,24 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 	tm.updateReentryReset(symbol, "LONG", sr)
 	tm.updateReentryReset(symbol, "SHORT", sr)
 	if sr.Score <= 0 {
+		log.Printf("%s 未开仓：策略得分 %.4f <= 0", symbol, sr.Score)
 		return nil
 	}
 	price := sr.Metrics.Last
 	if price <= 0 {
+		log.Printf("%s 未开仓：最新价格无效 %.6f", symbol, price)
 		return nil
 	}
 	key := sr.Last3mBarID + "::" + sr.Last5mBarID
 	if key != "::" && !tm.shouldEvaluateSymbolKey(symbol, key) {
+		log.Printf("%s 未开仓：已评估过最近 K 线快照 %s", symbol, key)
 		return nil
 	}
 	if !tm.evaluateEntryEnvironment(ctx, &sr) {
 		if len(sr.BlockReasons) > 0 {
 			log.Printf("%s 环境不满足开仓: %s", symbol, strings.Join(sr.BlockReasons, "; "))
+		} else {
+			log.Printf("%s 未开仓：环境过滤未通过（无具体原因）", symbol)
 		}
 		return nil
 	}
@@ -2304,6 +2311,7 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 		if !tm.canEnterAfterReset(symbol, "LONG", sr) {
 			if tm.isRecentlyClosed(symbol, "LONG") {
 				sr.BlockReasons = append(sr.BlockReasons, "最近平仓冷却中")
+				log.Printf("%s 未开多：%s", symbol, strings.Join(sr.BlockReasons, "; "))
 			}
 			goto shortCheck
 		}
@@ -2325,6 +2333,7 @@ shortCheck:
 		if !tm.canEnterAfterReset(symbol, "SHORT", sr) {
 			if tm.isRecentlyClosed(symbol, "SHORT") {
 				sr.BlockReasons = append(sr.BlockReasons, "最近平仓冷却中")
+				log.Printf("%s 未开空：%s", symbol, strings.Join(sr.BlockReasons, "; "))
 			}
 			return firstErr
 		}
@@ -2339,6 +2348,16 @@ shortCheck:
 		}
 	}
 	tm.storeSnapshot(sr)
+	if !sr.LongSignal && !sr.ShortSignal {
+		log.Printf("%s 未开仓：多空信号均未触发", symbol)
+	} else {
+		if sr.LongSignal && tm.positions.Has(symbol, "LONG") {
+			log.Printf("%s 未开多：已有多头持仓", symbol)
+		}
+		if sr.ShortSignal && tm.positions.Has(symbol, "SHORT") {
+			log.Printf("%s 未开空：已有空头持仓", symbol)
+		}
+	}
 	return firstErr
 }
 
