@@ -1837,76 +1837,48 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 	if len(watchSymbols) > 0 {
 		b.WriteString(fmt.Sprintf("当前监听币种(%d): %s\n", len(watchSymbols), strings.Join(watchSymbols, ", ")))
 	}
-	b.WriteString(fmt.Sprintf("30m 涨幅 Top%d:\n", top))
-	if len(gainers) == 0 {
-		b.WriteString("暂无涨幅数据\n")
-	} else {
-		if len(gainers) < top {
-			b.WriteString(fmt.Sprintf("（仅 %d 个满足条件）\n", len(gainers)))
+	b.WriteString("信号列表 (仅展示满足开仓条件的标的)：\n")
+	printed := false
+	for _, sr := range strategies {
+		if !sr.LongSignal && !sr.ShortSignal {
+			continue
 		}
-		for i, g := range gainers {
-			b.WriteString(fmt.Sprintf("%2d) %-12s 30m:%+0.4f%% 10m:%+0.4f%% 1h:%+0.4f%% 2h:%+0.4f%% Avg振幅:%0.4f%% 收盘价: %.8f%s\n",
-				i+1,
-				g.Symbol,
-				g.Change30m,
-				g.Change10m,
-				g.Change60m,
-				g.Change120m,
-				g.AvgAmplitude,
-				g.Last,
-				formatQtyInfo(qtyMap, g.Symbol),
-			))
+		printed = true
+		direction := "开多"
+		if sr.ShortSignal {
+			direction = "开空"
 		}
+		b.WriteString(fmt.Sprintf("[%s] %-10s 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s\n",
+			direction,
+			sr.Symbol,
+			sr.Metrics.Change30m,
+			sr.Metrics.Change10m,
+			sr.Metrics.AvgAmplitude,
+			summarizeTimeframe(sr.FiveMinute),
+			summarizeTimeframe(sr.OneMinute),
+			formatQtyInfo(qtyMap, sr.Symbol),
+		))
 	}
-	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("30m 跌幅 Top%d:\n", top))
-	if len(losers) == 0 {
-		b.WriteString("暂无跌幅数据\n")
-	} else {
-		if len(losers) < top {
-			b.WriteString(fmt.Sprintf("（仅 %d 个满足条件）\n", len(losers)))
-		}
-		for i, l := range losers {
-			b.WriteString(fmt.Sprintf("%2d) %-12s 30m:%+0.4f%% 10m:%+0.4f%% 1h:%+0.4f%% 2h:%+0.4f%% Avg振幅:%0.4f%% 收盘价: %.8f%s\n",
-				i+1,
-				l.Symbol,
-				l.Change30m,
-				l.Change10m,
-				l.Change60m,
-				l.Change120m,
-				l.AvgAmplitude,
-				l.Last,
-				formatQtyInfo(qtyMap, l.Symbol),
-			))
-		}
+	if !printed {
+		b.WriteString("暂无可开仓信号\n")
 	}
-	b.WriteString("\n")
-	b.WriteString("策略监控 (1m & 5m EMA/MACD/ADX)：\n")
-	if len(strategies) == 0 {
-		b.WriteString("暂无监听数据或数据不足\n")
-	} else {
-		for _, sr := range strategies {
-			longStatus := "L❌"
-			if sr.LongSignal {
-				longStatus = "L✅"
-			}
-			shortStatus := "S❌"
-			if sr.ShortSignal {
-				shortStatus = "S✅"
-			}
-			b.WriteString(fmt.Sprintf("%s/%s %-10s 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s\n",
-				longStatus,
-				shortStatus,
-				sr.Symbol,
-				sr.Metrics.Change30m,
-				sr.Metrics.Change10m,
-				sr.Metrics.AvgAmplitude,
-				summarizeTimeframe(sr.FiveMinute),
-				summarizeTimeframe(sr.OneMinute),
-				formatQtyInfo(qtyMap, sr.Symbol),
-			))
+
+	b.WriteString("\n涨幅榜 (Top %d)：\n")
+	for i, g := range gainers {
+		if i >= top {
+			break
 		}
+		b.WriteString(fmt.Sprintf("%2d) %-12s 30m:%+0.4f%% 10m:%+0.4f%% 收盘价: %.8f\n", i+1, g.Symbol, g.Change30m, g.Change10m, g.Last))
 	}
+
+	b.WriteString("\n跌幅榜 (Top %d)：\n")
+	for i, l := range losers {
+		if i >= top {
+			break
+		}
+		b.WriteString(fmt.Sprintf("%2d) %-12s 30m:%+0.4f%% 10m:%+0.4f%% 收盘价: %.8f\n", i+1, l.Symbol, l.Change30m, l.Change10m, l.Last))
+	}
+
 	return strings.TrimSpace(b.String())
 }
 
