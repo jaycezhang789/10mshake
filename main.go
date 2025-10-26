@@ -1174,6 +1174,10 @@ type tradeManager struct {
 	lastEvaluated    map[string]string
 	recentlyClosedMu sync.RWMutex
 	recentlyClosed   map[string]time.Time
+	telegramMu       sync.Mutex
+	lastTelegram     time.Time
+	rankMu           sync.RWMutex
+	volumeRanks      map[string]int
 }
 
 func newTradeManager(client *binanceClient, positions []positionEntry, cfg config, httpClient *http.Client, watchMgr *symbolManager) *tradeManager {
@@ -1293,6 +1297,30 @@ func (tm *tradeManager) isRecentlyClosed(symbol, side string) bool {
 	}
 	_, ok := tm.recentlyClosed[tm.recentlyClosedKey(symbol, side)]
 	return ok
+}
+
+func (tm *tradeManager) SetVolumeRanks(ranks map[string]int) {
+	tm.rankMu.Lock()
+	if len(ranks) == 0 {
+		tm.volumeRanks = nil
+		tm.rankMu.Unlock()
+		return
+	}
+	copyRanks := make(map[string]int, len(ranks))
+	for sym, rank := range ranks {
+		copyRanks[strings.ToUpper(sym)] = rank
+	}
+	tm.volumeRanks = copyRanks
+	tm.rankMu.Unlock()
+}
+
+func (tm *tradeManager) getVolumeRank(symbol string) int {
+	tm.rankMu.RLock()
+	defer tm.rankMu.RUnlock()
+	if tm.volumeRanks == nil {
+		return 0
+	}
+	return tm.volumeRanks[strings.ToUpper(symbol)]
 }
 
 func (tm *tradeManager) storeSnapshot(sr strategyResult) {
@@ -2067,6 +2095,7 @@ func (tm *tradeManager) checkBTCCooloff(ctx context.Context) bool {
 	tm.btcCooloffUntil = expiry
 	tm.volMu.Unlock()
 	log.Printf("BTC 15m 波动触发冷静期，TR=%.4f ATR=%.4f，冷静期至 %s", tr, atr, expiry.Format(time.RFC3339))
+	tm.sendTelegram(ctx, fmt.Sprintf("⚠️ BTC 15m 波动触发冷静期\nTR: %.4f  ATR: %.4f\n冷静期至: %s", tr, atr, expiry.Format("15:04:05")))
 	return false
 }
 
@@ -2388,6 +2417,12 @@ func (tm *tradeManager) openPosition(ctx context.Context, symbol, side string, p
 	}
 	tm.setEntryTime(symbol, side, time.Now())
 	log.Printf("%s %s 开仓成功，数量 %s", symbol, side, formatQuantity(qty))
+	rank := tm.getVolumeRank(symbol)
+	rankLine := ""
+	if rank > 0 {
+		rankLine = fmt.Sprintf("\n成交量排名: #%d", rank)
+	}
+	tm.sendTelegram(ctx, fmt.Sprintf("✅ 开仓 %s %s\n数量: %s\n价格: %.6f%s", symbol, side, formatQuantity(qty), price, rankLine))
 	return nil
 }
 
@@ -2417,11 +2452,44 @@ func (tm *tradeManager) determineOpenQuantity(ctx context.Context, symbol string
 	return tm.client.AdjustQuantity(ctx, symbol, qty)
 }
 
-func (tm *tradeManager) notifyError(_ context.Context, msg string) {
+func (tm *tradeManager) sendTelegram(ctx context.Context, msg string) {
+	if tm.httpClient == nil || msg == "" {
+		return
+	}
+	if tm.cfg.telegramToken == "" || tm.cfg.telegramChatID == "" {
+		return
+	}
+	tm.telegramMu.Lock()
+	defer tm.telegramMu.Unlock()
+	sleepNeeded := time.Duration(0)
+	if !tm.lastTelegram.IsZero() {
+		elapsed := time.Since(tm.lastTelegram)
+		if guard := 900 * time.Millisecond; elapsed < guard {
+			sleepNeeded = guard - elapsed
+		}
+	}
+	if sleepNeeded > 0 {
+		timer := time.NewTimer(sleepNeeded)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+	if err := sendTelegramChunks(ctx, tm.httpClient, tm.cfg.telegramToken, tm.cfg.telegramChatID, msg); err != nil {
+		log.Printf("发送 Telegram 消息失败: %v", err)
+		return
+	}
+	tm.lastTelegram = time.Now()
+}
+
+func (tm *tradeManager) notifyError(ctx context.Context, msg string) {
 	if msg == "" {
 		return
 	}
 	log.Printf("交易错误: %s", msg)
+	tm.sendTelegram(ctx, "❗️ "+msg)
 }
 
 func (tm *tradeManager) UpdateQuantitiesFromMetrics(ctx context.Context, metrics []symbolMetrics) map[string]float64 {
@@ -2539,6 +2607,7 @@ func (tm *tradeManager) closePosition(ctx context.Context, symbol, side string) 
 	}
 	tm.clearEntryTime(symbol, side)
 	log.Printf("%s %s 平仓成功，数量 %s", symbol, side, formatQuantity(adjQty))
+	tm.sendTelegram(ctx, fmt.Sprintf("✅ 平仓 %s %s\n数量: %s", symbol, side, formatQuantity(adjQty)))
 	return nil
 }
 
@@ -2605,6 +2674,8 @@ type config struct {
 	concurrency           int
 	updateInterval        time.Duration
 	volumeRefresh         time.Duration
+	telegramToken         string
+	telegramChatID        string
 	emaFastPeriod         int
 	emaSlowPeriod         int
 	macdFastPeriod        int
@@ -2682,7 +2753,7 @@ func loadEnvFile(path string) error {
 func parseConfig() config {
 	concurrency := flag.Int("concurrency", 10, "并发请求数量")
 	updateInterval := flag.Duration("update-interval", 10*time.Minute, "涨跌幅更新周期")
-	volumeRefresh := flag.Duration("volume-refresh", 12*time.Hour, "成交量榜刷新周期")
+	volumeRefresh := flag.Duration("volume-refresh", 4*time.Hour, "成交量榜刷新周期")
 	emaFast := flag.Int("ema-fast", 7, "5m EMA 快速周期")
 	emaSlow := flag.Int("ema-slow", 25, "5m EMA 慢速周期")
 	macdFast := flag.Int("macd-fast", 12, "MACD 快速 EMA 周期")
@@ -2712,6 +2783,8 @@ func parseConfig() config {
 		concurrency:           *concurrency,
 		updateInterval:        *updateInterval,
 		volumeRefresh:         *volumeRefresh,
+		telegramToken:         os.Getenv("TELEGRAM_BOT_TOKEN"),
+		telegramChatID:        os.Getenv("TELEGRAM_CHAT_ID"),
 		emaFastPeriod:         *emaFast,
 		emaSlowPeriod:         *emaSlow,
 		macdFastPeriod:        *macdFast,
@@ -2736,7 +2809,7 @@ func parseConfig() config {
 		cfg.updateInterval = 10 * time.Minute
 	}
 	if cfg.volumeRefresh <= 0 {
-		cfg.volumeRefresh = 12 * time.Hour
+		cfg.volumeRefresh = 4 * time.Hour
 	}
 	if cfg.emaFastPeriod < 1 {
 		cfg.emaFastPeriod = 7
@@ -2864,9 +2937,16 @@ func run(cfg config) error {
 			return errors.New("筛选后无可用交易对")
 		}
 
+		rankMap := make(map[string]int, len(filt))
+		for i, sym := range filt {
+			rankMap[strings.ToUpper(sym)] = i + 1
+		}
 		symbolsMu.Lock()
 		symbols = filt
 		symbolsMu.Unlock()
+		if tradeMgr != nil {
+			tradeMgr.SetVolumeRanks(rankMap)
+		}
 		log.Printf("已刷新成交量前50%%交易对，共 %d 个", len(filt))
 		return nil
 	}
@@ -2981,6 +3061,12 @@ func run(cfg config) error {
 	defer positionTicker.Stop()
 
 	log.Printf("启动完成：成交量刷新周期 %s，指标评估周期 %s", cfg.volumeRefresh, cfg.updateInterval)
+	if cfg.telegramToken != "" && cfg.telegramChatID != "" {
+		startupMsg := fmt.Sprintf("🤖 10mshake 已启动\n成交量刷新周期: %s\n指标评估周期: %s", cfg.volumeRefresh, cfg.updateInterval)
+		if err := sendTelegramChunks(ctx, httpClient, cfg.telegramToken, cfg.telegramChatID, startupMsg); err != nil {
+			log.Printf("启动 Telegram 提醒失败: %v", err)
+		}
+	}
 
 	for {
 		select {
@@ -3094,6 +3180,85 @@ func computeSymbolMetrics(ctx context.Context, c *http.Client, symbols []string,
 		return ai > aj
 	})
 	return res
+}
+
+func splitTelegramChunks(text string, limit int) []string {
+	clean := strings.TrimSpace(text)
+	if clean == "" {
+		return nil
+	}
+	runes := []rune(clean)
+	if limit <= 0 {
+		limit = 3500
+	}
+	var chunks []string
+	for len(runes) > 0 {
+		if len(runes) <= limit {
+			chunks = append(chunks, strings.TrimSpace(string(runes)))
+			break
+		}
+		cut := limit
+		for cut > 0 && runes[cut-1] != '\n' {
+			cut--
+		}
+		if cut <= limit/2 {
+			cut = limit
+		}
+		chunk := strings.TrimSpace(string(runes[:cut]))
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		runes = runes[cut:]
+		for len(runes) > 0 && runes[0] == '\n' {
+			runes = runes[1:]
+		}
+	}
+	return chunks
+}
+
+func sendTelegramMessage(ctx context.Context, c *http.Client, token, chatID, text string) error {
+	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+	form := url.Values{}
+	form.Set("chat_id", chatID)
+	form.Set("text", text)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Telegram API 返回状态 %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+func sendTelegramChunks(ctx context.Context, c *http.Client, token, chatID, text string) error {
+	chunks := splitTelegramChunks(text, 3500)
+	if len(chunks) == 0 {
+		return nil
+	}
+	for i, chunk := range chunks {
+		if err := sendTelegramMessage(ctx, c, token, chatID, chunk); err != nil {
+			return err
+		}
+		if i < len(chunks)-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(600 * time.Millisecond):
+			}
+		}
+	}
+	return nil
 }
 
 func computeTimeframeAnalysis(interval string, candles []candle, cfg config) (timeframeAnalysis, error) {
