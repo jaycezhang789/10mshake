@@ -1525,47 +1525,34 @@ func run(cfg config) error {
 		}
 
 		gainers, losers := splitTopMovers(results, cfg.top)
-		watchSymbols := selectTopSymbols(results, cfg.watchCount)
-		positionSet := make(map[string]struct{})
+		watchSet := make(map[string]struct{}, len(snapshot))
+		for _, sym := range snapshot {
+			upper := strings.ToUpper(sym)
+			if upper == "" {
+				continue
+			}
+			watchSet[upper] = struct{}{}
+		}
 		if cfg.autoTrade && tradeMgr != nil {
 			for _, sym := range tradeMgr.positions.Symbols() {
 				upper := strings.ToUpper(sym)
 				if upper == "" {
 					continue
 				}
-				positionSet[upper] = struct{}{}
+				watchSet[upper] = struct{}{}
 			}
 		}
-		actualWatchSymbols := make([]string, 0, len(watchSymbols))
-		for _, sym := range watchSymbols {
-			upper := strings.ToUpper(sym)
-			if upper == "" {
-				continue
-			}
-			if _, held := positionSet[upper]; held {
-				continue
-			}
-			actualWatchSymbols = append(actualWatchSymbols, upper)
+		watchSymbols := make([]string, 0, len(watchSet))
+		for sym := range watchSet {
+			watchSymbols = append(watchSymbols, sym)
 		}
+		sort.Strings(watchSymbols)
 		if tradeMgr != nil && tradeMgr.watchMgr != nil {
-			watchTargets := make(map[string]struct{}, len(actualWatchSymbols)+len(positionSet))
-			for _, sym := range actualWatchSymbols {
-				watchTargets[sym] = struct{}{}
-			}
-			for sym := range positionSet {
-				watchTargets[sym] = struct{}{}
-			}
-			if len(watchTargets) > 0 {
-				symbolsForWatch := make([]string, 0, len(watchTargets))
-				for sym := range watchTargets {
-					symbolsForWatch = append(symbolsForWatch, sym)
-				}
-				tradeMgr.watchMgr.EnsureWatchers(ctx, symbolsForWatch)
-			}
-		} else if len(actualWatchSymbols) > 0 {
-			watchMgr.EnsureWatchers(ctx, actualWatchSymbols)
+			tradeMgr.watchMgr.EnsureWatchers(ctx, watchSymbols)
+		} else if len(watchSymbols) > 0 {
+			watchMgr.EnsureWatchers(ctx, watchSymbols)
 		}
-		strategies := watchMgr.EvaluateStrategies(actualWatchSymbols)
+		strategies := watchMgr.EvaluateStrategies(watchSymbols)
 		var qtyMap map[string]float64
 		if cfg.autoTrade && tradeMgr != nil {
 			qtyMap = tradeMgr.UpdateQuantitiesFromMetrics(ctxUpdate, results)
@@ -1574,7 +1561,7 @@ func run(cfg config) error {
 			tradeMgr.HandleSignals(ctxUpdate, strategies)
 			qtyMap = tradeMgr.snapshotQuantities()
 		}
-		message := buildTelegramMessage(time.Now(), len(snapshot), cfg.top, gainers, losers, strategies, actualWatchSymbols, qtyMap)
+		message := buildTelegramMessage(time.Now(), len(snapshot), cfg.top, gainers, losers, strategies, watchSymbols, qtyMap)
 		if message == "" {
 			return errors.New("推送内容为空")
 		}
@@ -1587,7 +1574,7 @@ func run(cfg config) error {
 				log.Printf("发送信号提醒失败: %v", err)
 			}
 		}
-		log.Printf("已推送Telegram通知，涨幅榜: %d 条，跌幅榜: %d 条，监听币种: %d", len(gainers), len(losers), len(actualWatchSymbols))
+		log.Printf("已推送Telegram通知，涨幅榜: %d 条，跌幅榜: %d 条，监听币种: %d", len(gainers), len(losers), len(watchSymbols))
 		return nil
 	}
 
