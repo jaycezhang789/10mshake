@@ -1,80 +1,209 @@
 # 10mshake
 
-Go 程序，用于监控币安 U 本位永续合约，定期筛选出成交量前 50% 的交易对，并将 30 分钟涨跌榜推送到 Telegram。
+Go 编写的币安 U 本位合约量化框架。程序自动筛选成交量最活跃的交易对，基于 3m/5m 双周期指标实时识别趋势，执行分阶段的开/平仓决策，并通过 WebSocket 追踪最新行情。
 
-## 功能
+---
 
-- 每 12 小时重新获取一次所有 USDT 永续合约的 24h 基础资产成交量，并筛选成交量前 50% 的交易对。
-- 每 10 分钟拉取这些交易对的 1m K 线（499 条），计算最近 30 分钟涨跌幅。
-- 分别统计最近 30 分钟涨幅、跌幅前 N 名（默认 20），发送文本消息到 Telegram 指定聊天。
-- 对涨跌榜排序后的前 `watch-count` 个交易对建立 1m WebSocket 监听，首次拉取 499 条 1m K 线并持续更新，并在推送中展示每个交易对的实时潜在下单数量（已按最小步长取整）。
-- 若启用自动下单，每 6 分钟额外推送账户当前持仓及 5m EMA/MACD/ADX 等平仓决策所需指标。
-- 基于监听到的 1m 数据合成 5m K 线，额外计算 30 分钟、1 小时、2 小时涨跌幅、平均振幅，以及 5m 周期的 EMA/MACD/ADX 指标，并在推送中展示策略是否满足：
-  - EMA 发散：EMA(fast) > EMA(slow) 且二者斜率向上
-  - MACD 动量：MACD_H > 0 且柱状图放大
-  - ADX 强度：ADX > `adx-threshold`
-- 自动加载 `.env` 文件（若存在），便于管理私密凭证。
+## 功能概览
 
-## 运行
+- **成交量筛选**：每 4 小时拉取全部 USDT 永续合约 24h 成交量，只保留排名前 50% 的交易对作为候选池。
+- **实时行情**：为候选池订阅 Binance `kline_3m` / `kline_5m` 合并流；启动时会用 REST 补齐 499 根历史 K 线。
+- **双周期策略**：
+  - 5m 负责判定趋势方向（EMA 差值归一化、ADX 斜率、MACD 动量）。
+  - 3m 负责择时（MACD 零轴滞回、EMA 快线回踩再上、动量放大）。
+- **自动下单**：默认使用账户总余额的 1/3 作为保证金，乘以杠杆转换为名义价值，再除以最新价得到下单数量。支持固定手数。
+- **持仓管理**：收紧→吊灯→确认三段式退出；结合最小持仓时长、回撤重置和价格再突破等再入门槛，避免高频震荡。
+- **冷静期与过滤**：包含震荡过滤器（Choppiness/ADX）、BTC 15m 波动冷静期、点差与深度阈值、持仓冷却计数等保护。
+- **日志驱动**：所有关键事件（筛选、评估、下单、退出、异常）均输出到标准日志，便于统一采集。
 
-要求本机已安装 Go 1.21+。程序启动后会持续运行，直到手动终止：
+---
+
+## 运行要求
+
+- Go 1.21 及以上
+- 一个可访问 Binance 合约 API 的网络环境
+- 若启用真实交易，需要 Binance U 本位合约 API Key（具备下单权限）
+
+---
+
+## 快速开始
 
 ```bash
-go run .
-# 或构建二进制运行
+git clone <repo>
+cd 10mshake
+
+# 构建或直接运行
 go build -o 10mshake
 ./10mshake
+# 或
+go run .
 ```
 
-## 命令行参数
+程序启动后会：
 
-- `-concurrency` 并发请求数量，默认 10。
-- `-top` 涨跌榜数量（涨、跌各 N 名），默认 20。
-- `-update-interval` 涨跌榜推送周期，默认 `10m`。
-- `-volume-refresh` 成交量榜刷新周期，默认 `12h`。
-- `-watch-count` 需要建立 WebSocket 监听的交易对数量，默认 20。
-- `-ema-fast`、`-ema-slow` 5m EMA 快慢线周期，默认 7/25。
-- `-macd-fast`、`-macd-slow`、`-macd-signal` MACD 快线、慢线与信号线周期，默认 12/26/9。
-- `-adx-period` 5m ADX 计算周期，默认 14。
-- `-adx-threshold` ADX 趋势强度阈值，默认 25。
-- `-auto-trade` 启用自动下单逻辑，默认开启（如需仅观察行情，可传 `-auto-trade=false`）。
-- `-order-qty` 每笔下单数量（或设置 `BINANCE_ORDER_QTY` 环境变量），默认 0（自动以账户总余额的 1/10 作为保证金，并乘以杠杆换算名义价值）。
-- `-max-positions` 最大持仓数量，默认 10。
-- `-leverage` 杠杆倍数，默认 5。
-- `-recv-window` Binance API 请求 recvWindow，默认 5000ms。
+1. 尝试从当前目录读取 `.env`（无则忽略）。
+2. 加载命令行参数，初始化 http/websocket 客户端。
+3. 刷新成交量榜、订阅候选交易对、补齐历史 K 线。
+4. 进入主循环（成交量刷新 / 指标评估 / 持仓快照），并在 WebSocket 事件中执行实时评估。
 
-示例：
+使用 `Ctrl+C` 或发送 `SIGTERM` 结束程序。
+
+---
+
+## 配置说明
+
+### 环境变量（可写在 `.env`）
+
+| 变量 | 说明 |
+|------|------|
+| `BINANCE_API_KEY` | 必填，自动交易使用的 API Key |
+| `BINANCE_API_SECRET` | 必填，对应的 Secret |
+| `BINANCE_ORDER_QTY` | 可选，固定下单数量（与 `-order-qty` 功能一致） |
+
+> `.env` 中的值不会覆盖已存在的系统环境变量。
+
+### 常用命令行参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-concurrency` | 10 | 并发拉取 REST 行情的最大协程数 |
+| `-update-interval` | `10m` | 主循环定时重新评估候选池的周期 |
+| `-volume-refresh` | `4h` | 刷新成交量前 50% 交易对的周期 |
+| `-ema-fast / -ema-slow` | 7 / 25 | EMA 快慢线周期（两周期共用） |
+| `-macd-fast / -macd-slow / -macd-signal` | 12 / 26 / 9 | MACD 参数 |
+| `-adx-period` | 14 | ADX 周期 |
+| `-adx-threshold` | 25 | ADX 最低强度 |
+| `-ema-diff-threshold` | 0 | 5m EMA 差值最小要求（绝对值） |
+| `-auto-trade` | `true` | 是否启用真实下单 |
+| `-order-qty` | 0 | 固定下单数量（>0 时覆盖动态保证金计算） |
+| `-max-positions` | 10 | 最大持仓数量 |
+| `-leverage` | 5 | 默认杠杆倍数（建仓前会设置） |
+| `-recv-window` | 5000 | Binance API recvWindow |
+
+示例：以 5 分钟评估间隔运行观察模式（不下单）：
 
 ```bash
-go run . -concurrency 8 -top 15 -update-interval 5m -volume-refresh 6h
+go run . -update-interval 5m -auto-trade=false
 ```
 
-## 环境变量 / `.env`
+---
 
-程序启动时会尝试加载当前目录下的 `.env` 文件（不会覆盖已存在的系统环境变量）。使用步骤：
+## 数据流程与组件
 
-1. 复制 `.env.example` 为 `.env`
-2. 根据实际情况填写：
-   - `TELEGRAM_BOT_TOKEN` Telegram 机器人 Token（必填）
-   - `TELEGRAM_CHAT_ID` Telegram 接收方 Chat ID（必填）
-   - `BINANCE_API_KEY`、`BINANCE_API_SECRET` 如需调用受限接口可填写（当前逻辑未使用，可留空）
+1. **成交量刷新**  
+   `refreshVolumeList` 请求 `ticker/24hr`，结合 `exchangeInfo` 获取所有 USDT 永续合约成交量，按成交量降序截取前 50%。结果存入内存，供后续评估使用。
 
-## 说明
+2. **行情补齐与订阅**  
+   `EnsureWatchers` 为每个候选交易对初始化 `intervalWatcher`：先用 REST 拉取 499 根历史 K 线，随后交由 `intervalHub` 共享的 WebSocket 连接统一订阅 `kline_3m` / `kline_5m`。
 
-- 程序使用币安公开 REST API，无需 API Key 即可运行。
-- 对 HTTP 请求增加了简单的重试与并发限制以减少触发限频的风险。
-- Telegram 推送基于 `sendMessage` 接口，如需富文本可自行扩展格式化逻辑。
-- 平均振幅按最近 10 条 1m K 线的 `(high - low) / low` 计算，去掉 2 个最大值和最小值后求均值。
-- WebSocket 监听默认保留最近 2000 条 1m K 线，并基于这些数据合成 5m K 线与指标。
-- 代码已使用 `gofmt` 整理；后续如需格式化，可执行 `/usr/local/go/bin/gofmt -w main.go`。
+3. **实时评估**  
+   每当 WebSocket 接收到收盘 K 线，`OnCandleUpdate` 会：
+   - 重算 `strategyResult`（包含 3m/5m 指标、最近涨跌幅、ATR/ADX 等）。
+   - 根据当前持仓调用 `checkPositionForSymbol` 执行退出逻辑。
+   - 在满足环境与重入条件时调用 `evaluateOpenForSymbol` 开仓尝试。
 
-## 自动下单说明
+4. **定时评估**  
+   主循环按照 `update-interval` 重新批量计算成交量池指标，并调用 `HandleSignals`（排序 + 动态调整下单量 + 批量尝试开仓）。
 
-- 通过 `-auto-trade` 开启真实交易；需在 `.env` 或环境变量中配置 `BINANCE_API_KEY`、`BINANCE_API_SECRET`。
-- 每笔下单数量可通过 `-order-qty` 或 `BINANCE_ORDER_QTY` 指定；若留空则自动取账户总余额的 1/10 作为保证金，结合杠杆换算名义价值，再除以最新价得到合约张数（同时在行情推送中展示候选数量）。程序默认使用全仓、双向持仓，并自动设置 5 倍杠杆（可调）。
-- 依据策略：
-  - 开多：在 5m 与 1m 两个周期上同时满足 `EMA_fast > EMA_slow` 且快慢线斜率向上、`MACD_H > 0` 且柱状图放大、`ADX > 阈值`。
-  - 平多：1m 周期任一条件失效（`EMA_fast <= EMA_slow` 或 `MACD_H <= 0`）。
-  - 开空：5m 与 1m 两个周期均满足上述条件的反向组合。
-  - 平空：1m 周期出现 `EMA_fast >= EMA_slow` 或 `MACD_H >= 0`。
-- 最大持仓默认为 10；超过即暂停加仓。每次下单前会再次检查剩余可用仓位。
+5. **持仓快照**  
+   每 6 分钟刷新一次账户持仓，通过 REST 再次计算指标，确保退出逻辑有最新数据。
+
+---
+
+## 策略细节
+
+### 指标计算
+
+- 基于 3m、5m 两个周期，计算 EMA(7/25)、MACD(12/26/9)、ADX(14)、ATR(22/50)、Choppiness、22 根最高/最低、MACD 直方图标准差等。
+- 5m 方向指标：  
+  - `Sep = (EMA_fast − EMA_slow) / ATR50`  
+  - ADX 要求 ≥ max(`adx-direction-threshold`, 22)，近 3 根持续走强。
+  - Sep 绝对值 ≥ 0.8 才视作明显趋势。
+- 3m 择时指标：  
+  - MACD Hist 必须穿越 ±ε（ε = 0.15 × Hist200 标准差）。  
+  - 允许两种达成方式：零轴滞回突破、或价格回踩 3m EMA_fast 后重新站上。
+
+### 开仓逻辑
+
+- 按成交量前 50% 的交易对集合（附加当前持仓 symbol）作为评估对象。
+- 若未设置固定手数，默认下单保证金 = 账户总余额 / 3。乘以杠杆后除以最新价得到下单张数，并通过 `AdjustQuantity` 对齐合约最小步长。
+- 每个 symbol 同向仅可持有一笔仓位，总仓位数不超过 `max-positions`。
+- 开仓前进行环境过滤：
+  - 震荡过滤：`Choppiness > 61` 且 `ADX < 18` → 跳过。
+  - BTC 15m 波动：若 TR ≥ 3 × ATR50，则进入 15 分钟冷静期，仅允许平仓。
+  - 点差/深度：`(bestAsk - bestBid) / ATR22 ≤ 0.07` 且双侧深度充足。
+  - 重入门槛：需要先触发 Reset，再突破上次退出价 ±0.6 × ATR3m，且冷却计数归零。
+
+### 退出策略
+
+1. **收紧阶段**（动量预警）：  
+   3m MACD Hist 连续两根走弱且仍位于 ±ε 外，同时 5m Sep 回落到 ±0.8 内 → 触发收紧，计算吊灯止损：
+
+   ```
+   CE = HighestHigh(3m,22) - k × ATR22   (多头，空头取对称)
+   ```
+
+   `k = 2.8`（趋势强）或 `≈2.1`（较弱趋势，依据 ADX / Sep）。
+
+2. **吊灯止损**：  
+   价格触碰 CE，立即以市价平仓，标记为“硬退出”，记录最近平仓价并设置重入冷却。
+
+3. **确认退出**（软退出）：  
+   收紧状态下，只要满足以下任意一项且已达到最小持仓时长（默认 3 根 3m）：
+   - 回撤 ≥ 1.8 × ATR22
+   - 未实现利润回吐 ≥ 0.8R（R = 初始风险）
+   - 5m Sep 回落到 ±0.5 区间并伴随 EMA_fast 斜率翻转
+
+4. **基线退出**：  
+   尚未收紧时，一旦 3m MACD Hist 穿越反向阈值，或 5m Sep 回到 ±0.5 并且 EMA_fast 斜率转向，即执行软退出。
+
+### 重入与冷却
+
+- 平仓后进入 `Exit → Reset → Re-entry` 状态机：
+  - Exit：记录退出价 & 冷却计数（默认 6 根 3m）。
+  - Reset：必须看到 MACD Hist 触及反向区间或价格回撤至 EMA_fast ±0.4 × ATR50。
+  - Re-entry：价格重新突破退出价 ±0.6 × ATR50 且冷却归零，才允许同向重入。
+- 额外的 `recentlyClosed` 标记保证冷却期间不会重复开仓。
+
+---
+
+## 日志与监控
+
+- 所有关键信息通过 `log.Printf` 输出，可重定向到文件或接入日志系统。
+- 示例日志：
+  - `已刷新成交量前50%交易对，共 83 个`
+  - `开始监听 BTCUSDT 3m，初始K线: 499 条`
+  - `实时开多失败 BTCUSDT: binance api error ...`
+  - `BTCUSDT LONG 触发动量预警，收紧止盈`
+  - `完成行情评估，共评估 62 个交易对，生成策略: 5 条`
+- 建议结合外部监控（如 Promtail + Loki/Grafana）对日志进行实时分析。
+
+---
+
+## 常见问题
+
+**Q: 为什么日志显示“指标评估周期 10m0s”？**  
+A: 这是 `-update-interval` 的值，与 WebSocket 实时评估互不冲突。若想改为 5 分钟，可传 `-update-interval 5m`。
+
+**Q: 如果只想跑策略，不下真实订单？**  
+A: 启动时传 `-auto-trade=false`。此时仍会计算指标与日志输出，但不会调用下单接口，也无需配置 API Key。
+
+**Q: 如何调整默认参数？**  
+A: 任何命令行参数都可以写在启动脚本或 systemd service 中。动态变化（如换杠杆）需要重启程序。
+
+**Q: 是否还会推送 Telegram？**  
+A: Telegram 逻辑已完全移除。当前版本仅依赖日志输出。需要通知功能可在外部订阅日志或扩展代码。
+
+---
+
+## 开发与贡献
+
+- 编译前请运行 `gofmt -w .`。
+- 当前项目无第三方依赖，使用标准库 + `gorilla/websocket`。
+- 欢迎提交 Issue/PR 一起完善筛选、指标或风控逻辑。
+
+---
+
+## 声明
+
+本项目仅用于技术研究，真实交易需自担风险。币安 API 存在频率限制及网络波动，请务必先在测试账户或观察模式验证策略后，再投入真实资金。
