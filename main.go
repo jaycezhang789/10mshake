@@ -96,6 +96,7 @@ type strategyResult struct {
 	FiveMinute  timeframeAnalysis
 	LongSignal  bool
 	ShortSignal bool
+	Score       float64
 }
 
 type symbolWatcher struct {
@@ -924,6 +925,9 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 	if err != nil {
 		return err
 	}
+	if sr.Score <= 0 {
+		return nil
+	}
 	price := sr.Metrics.Last
 	if price <= 0 {
 		return nil
@@ -1076,6 +1080,11 @@ func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategy
 	if err := tm.refreshPositions(ctx); err != nil {
 		log.Printf("刷新持仓失败: %v", err)
 	}
+	if len(strategies) > 1 {
+		sort.Slice(strategies, func(i, j int) bool {
+			return strategies[i].Score > strategies[j].Score
+		})
+	}
 	if len(strategies) > 0 {
 		metrics := make([]symbolMetrics, 0, len(strategies))
 		for _, sr := range strategies {
@@ -1085,6 +1094,9 @@ func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategy
 	}
 
 	for _, sr := range strategies {
+		if sr.Score <= 0 {
+			continue
+		}
 		if tm.positions.Remaining() <= 0 {
 			break
 		}
@@ -1947,8 +1959,9 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 	for _, sr := range strategies {
 		if sr.LongSignal {
 			printed = true
-			b.WriteString(fmt.Sprintf("[开多] %-10s 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s\n",
+			b.WriteString(fmt.Sprintf("[开多] %-10s Score:%0.2f 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s\n",
 				sr.Symbol,
+				sr.Score,
 				sr.Metrics.Change30m,
 				sr.Metrics.Change10m,
 				sr.Metrics.AvgAmplitude,
@@ -1959,8 +1972,9 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 		}
 		if sr.ShortSignal {
 			printed = true
-			b.WriteString(fmt.Sprintf("[开空] %-10s 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s\n",
+			b.WriteString(fmt.Sprintf("[开空] %-10s Score:%0.2f 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s\n",
 				sr.Symbol,
+				sr.Score,
 				sr.Metrics.Change30m,
 				sr.Metrics.Change10m,
 				sr.Metrics.AvgAmplitude,
@@ -2028,9 +2042,10 @@ func buildSignalAlerts(strategies []strategyResult, qtyMap map[string]float64) s
 		}
 		qtyInfo := formatQtyInfo(qtyMap, sr.Symbol)
 		if sr.LongSignal {
-			lines = append(lines, fmt.Sprintf("[开多] %s%s 30m:%+.4f%% 10m:%+.4f%% 5m MACD_H:%+.4f ADX:%.2f | 3m MACD_H:%+.4f ADX:%.2f",
+			lines = append(lines, fmt.Sprintf("[开多] %s%s Score:%0.2f 30m:%+.4f%% 10m:%+.4f%% 5m MACD_H:%+.4f ADX:%.2f | 3m MACD_H:%+.4f ADX:%.2f",
 				sr.Symbol,
 				qtyInfo,
+				sr.Score,
 				sr.Metrics.Change30m,
 				sr.Metrics.Change10m,
 				sr.FiveMinute.MACDHist,
@@ -2040,9 +2055,10 @@ func buildSignalAlerts(strategies []strategyResult, qtyMap map[string]float64) s
 			))
 		}
 		if sr.ShortSignal {
-			lines = append(lines, fmt.Sprintf("[开空] %s%s 30m:%+.4f%% 10m:%+.4f%% 5m MACD_H:%+.4f ADX:%.2f | 3m MACD_H:%+.4f ADX:%.2f",
+			lines = append(lines, fmt.Sprintf("[开空] %s%s Score:%0.2f 30m:%+.4f%% 10m:%+.4f%% 5m MACD_H:%+.4f ADX:%.2f | 3m MACD_H:%+.4f ADX:%.2f",
 				sr.Symbol,
 				qtyInfo,
+				sr.Score,
 				sr.Metrics.Change30m,
 				sr.Metrics.Change10m,
 				sr.FiveMinute.MACDHist,
@@ -2090,13 +2106,14 @@ func buildPositionStatusMessage(now time.Time, entries []positionEntry, srMap ma
 				shortStatus = "S✅"
 			}
 			b.WriteString(fmt.Sprintf(
-				"%-12s %-5s Qty:%s %s/%s Last:%0.6f | %s | %s 30m:%+0.2f%% 10m:%+0.2f%%\n",
+				"%-12s %-5s Qty:%s %s/%s Last:%0.6f Score:%0.2f | %s | %s 30m:%+0.2f%% 10m:%+0.2f%%\n",
 				symbol,
 				entry.Side,
 				qtyText,
 				longStatus,
 				shortStatus,
 				sr.Metrics.Last,
+				sr.Score,
 				summarizeTimeframe(sr.FiveMinute),
 				summarizeTimeframe(sr.ThreeMinute),
 				sr.Metrics.Change30m,
@@ -2237,6 +2254,48 @@ func computeTimeframeAnalysis(interval string, candles []candle, cfg config) (ti
 	return analysis, nil
 }
 
+func scoreTimeframe(tf timeframeAnalysis, adxThreshold float64, long bool) float64 {
+	score := 0.0
+	adxBoost := tf.ADX - adxThreshold
+	if adxBoost > 0 {
+		score += adxBoost / 10.0
+	}
+	if long {
+		if diff := tf.EMAFast - tf.EMASlow; diff > 0 {
+			score += diff
+		}
+		if tf.EMAFastSlope > 0 {
+			score += tf.EMAFastSlope
+		}
+		if tf.EMASlowSlope > 0 {
+			score += tf.EMASlowSlope
+		}
+		if tf.MACDHist > 0 {
+			score += tf.MACDHist
+		}
+		if growth := tf.MACDHist - tf.MACDPrev; growth > 0 {
+			score += growth
+		}
+	} else {
+		if diff := tf.EMASlow - tf.EMAFast; diff > 0 {
+			score += diff
+		}
+		if tf.EMAFastSlope < 0 {
+			score += -tf.EMAFastSlope
+		}
+		if tf.EMASlowSlope < 0 {
+			score += -tf.EMASlowSlope
+		}
+		if tf.MACDHist < 0 {
+			score += -tf.MACDHist
+		}
+		if growth := tf.MACDPrev - tf.MACDHist; growth > 0 {
+			score += growth
+		}
+	}
+	return score
+}
+
 func computeStrategyFromCandles(symbol string, candles []candle, cfg config) (strategyResult, error) {
 	result := strategyResult{Symbol: symbol}
 	clean := dedupeCandles(candles)
@@ -2269,6 +2328,17 @@ func computeStrategyFromCandles(symbol string, candles []candle, cfg config) (st
 	result.FiveMinute = fiveMinute
 	result.LongSignal = threeMinute.LongSignal && fiveMinute.LongSignal
 	result.ShortSignal = threeMinute.ShortSignal && fiveMinute.ShortSignal
+	if result.LongSignal {
+		score3m := scoreTimeframe(threeMinute, cfg.adxThreshold, true)
+		score5m := scoreTimeframe(fiveMinute, cfg.adxThreshold, true)
+		result.Score = score3m*1.2 + score5m
+	} else if result.ShortSignal {
+		score3m := scoreTimeframe(threeMinute, cfg.adxThreshold, false)
+		score5m := scoreTimeframe(fiveMinute, cfg.adxThreshold, false)
+		result.Score = score3m*1.2 + score5m
+	} else {
+		result.Score = 0
+	}
 	return result, nil
 }
 
