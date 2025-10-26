@@ -76,9 +76,8 @@ type candle struct {
 	Volume    float64
 }
 
-type strategyResult struct {
-	Symbol       string
-	Metrics      symbolMetrics
+type timeframeAnalysis struct {
+	Interval     string
 	EMAFast      float64
 	EMASlow      float64
 	EMAFastSlope float64
@@ -88,6 +87,15 @@ type strategyResult struct {
 	ADX          float64
 	LongSignal   bool
 	ShortSignal  bool
+}
+
+type strategyResult struct {
+	Symbol      string
+	Metrics     symbolMetrics
+	OneMinute   timeframeAnalysis
+	FiveMinute  timeframeAnalysis
+	LongSignal  bool
+	ShortSignal bool
 }
 
 type symbolWatcher struct {
@@ -250,9 +258,32 @@ func (m *symbolManager) Close() {
 	}
 }
 
+func dedupeCandles(candles []candle) []candle {
+	if len(candles) < 2 {
+		return candles
+	}
+	result := make([]candle, 0, len(candles))
+	for _, c := range candles {
+		if len(result) == 0 {
+			result = append(result, c)
+			continue
+		}
+		last := &result[len(result)-1]
+		if last.OpenTime.Equal(c.OpenTime) {
+			*last = c
+			continue
+		}
+		if c.OpenTime.After(last.OpenTime) {
+			result = append(result, c)
+		}
+	}
+	return result
+}
+
 func newSymbolWatcher(symbol string, candles []candle) *symbolWatcher {
-	copyCandles := make([]candle, len(candles))
-	copy(copyCandles, candles)
+	clean := dedupeCandles(candles)
+	copyCandles := make([]candle, len(clean))
+	copy(copyCandles, clean)
 	return &symbolWatcher{
 		symbol:  symbol,
 		candles: copyCandles,
@@ -346,7 +377,7 @@ func (w *symbolWatcher) snapshot() []candle {
 	defer w.mu.RUnlock()
 	copyCandles := make([]candle, len(w.candles))
 	copy(copyCandles, w.candles)
-	return copyCandles
+	return dedupeCandles(copyCandles)
 }
 
 func (w *symbolWatcher) Close() {
@@ -780,33 +811,46 @@ type tradeManager struct {
 	qtyMu      sync.RWMutex
 	qty        map[string]float64
 	httpClient *http.Client
+	watchMgr   *symbolManager
 }
 
-func newTradeManager(client *binanceClient, positions []positionEntry, cfg config, httpClient *http.Client) *tradeManager {
+func newTradeManager(client *binanceClient, positions []positionEntry, cfg config, httpClient *http.Client, watchMgr *symbolManager) *tradeManager {
 	pm := newPositionManager(cfg.maxPositions)
 	pm.Replace(positions)
-	return &tradeManager{client: client, positions: pm, cfg: cfg, qty: make(map[string]float64), httpClient: httpClient}
+	return &tradeManager{client: client, positions: pm, cfg: cfg, qty: make(map[string]float64), httpClient: httpClient, watchMgr: watchMgr}
 }
 
 func shouldClosePosition(side string, sr strategyResult) bool {
+	tf := sr.OneMinute
 	switch strings.ToUpper(side) {
 	case "LONG":
-		return sr.EMAFast <= sr.EMASlow || sr.MACDHist <= 0
+		return tf.EMAFast <= tf.EMASlow || tf.MACDHist <= 0
 	case "SHORT":
-		return sr.EMAFast >= sr.EMASlow || sr.MACDHist >= 0
+		return tf.EMAFast >= tf.EMASlow || tf.MACDHist >= 0
 	default:
 		return false
 	}
 }
 
-func computeStrategyForSymbol(ctx context.Context, httpClient *http.Client, symbol string, cfg config) (strategyResult, error) {
+func computeStrategyForSymbol(ctx context.Context, watchMgr *symbolManager, symbol string, cfg config) (strategyResult, error) {
 	symbol = strings.ToUpper(symbol)
 	if symbol == "" {
 		return strategyResult{}, errors.New("symbol 为空")
 	}
-	candles, err := fetchHistorical1m(ctx, httpClient, symbol, positionKlineLimit)
-	if err != nil {
-		return strategyResult{}, err
+	if watchMgr == nil {
+		return strategyResult{}, errors.New("行情管理器未初始化")
+	}
+	w := watchMgr.getWatcher(symbol)
+	if w == nil {
+		watchMgr.EnsureWatchers(ctx, []string{symbol})
+		w = watchMgr.getWatcher(symbol)
+		if w == nil {
+			return strategyResult{}, fmt.Errorf("未找到 %s 的行情缓存", symbol)
+		}
+	}
+	candles := w.snapshot()
+	if len(candles) == 0 {
+		return strategyResult{}, errors.New("行情数据不足")
 	}
 	return computeStrategyFromCandles(symbol, candles, cfg)
 }
@@ -821,7 +865,7 @@ func (tm *tradeManager) refreshPositions(ctx context.Context) error {
 }
 
 func (tm *tradeManager) CheckPositionExits(ctx context.Context) error {
-	if tm == nil || tm.httpClient == nil {
+	if tm == nil {
 		return errors.New("trade manager 未初始化")
 	}
 	if err := tm.refreshPositions(ctx); err != nil {
@@ -833,6 +877,24 @@ func (tm *tradeManager) CheckPositionExits(ctx context.Context) error {
 	}
 
 	log.Printf("开始 5m 持仓检查，当前持仓数: %d", len(entries))
+	if tm.watchMgr != nil {
+		symbolSet := make(map[string]struct{}, len(entries))
+		for _, entry := range entries {
+			symbol := strings.ToUpper(entry.Symbol)
+			if symbol == "" {
+				continue
+			}
+			symbolSet[symbol] = struct{}{}
+		}
+		if len(symbolSet) > 0 {
+			symbols := make([]string, 0, len(symbolSet))
+			for sym := range symbolSet {
+				symbols = append(symbols, sym)
+			}
+			tm.watchMgr.EnsureWatchers(ctx, symbols)
+		}
+	}
+
 	strategies := make(map[string]strategyResult, len(entries))
 	for _, entry := range entries {
 		symbol := strings.ToUpper(entry.Symbol)
@@ -842,9 +904,7 @@ func (tm *tradeManager) CheckPositionExits(ctx context.Context) error {
 		if _, exists := strategies[symbol]; exists {
 			continue
 		}
-		ctxSymbol, cancel := context.WithTimeout(ctx, 45*time.Second)
-		sr, err := computeStrategyForSymbol(ctxSymbol, tm.httpClient, symbol, tm.cfg)
-		cancel()
+		sr, err := computeStrategyForSymbol(ctx, tm.watchMgr, symbol, tm.cfg)
 		if err != nil {
 			log.Printf("获取 %s 策略数据失败: %v", symbol, err)
 			continue
@@ -866,9 +926,7 @@ func (tm *tradeManager) CheckPositionExits(ctx context.Context) error {
 		if !shouldClosePosition(side, sr) {
 			continue
 		}
-		ctxClose, cancel := context.WithTimeout(ctx, 30*time.Second)
-		err := tm.closePosition(ctxClose, symbol, side)
-		cancel()
+		err := tm.closePosition(ctx, symbol, side)
 		if err != nil {
 			log.Printf("5m 检查平仓失败 %s %s: %v", symbol, side, err)
 			tm.notifyError(ctx, fmt.Sprintf("平仓失败 %s %s: %v", symbol, side, err))
@@ -1148,7 +1206,7 @@ func fetchHistorical1m(ctx context.Context, c *http.Client, symbol string, limit
 	if len(candles) == 0 {
 		return nil, errors.New("无历史K线数据")
 	}
-	return candles, nil
+	return dedupeCandles(candles), nil
 }
 
 func parseStringFloat(v interface{}) float64 {
@@ -1358,6 +1416,23 @@ func initializeExistingPositions(ctx context.Context, tradeMgr *tradeManager) {
 		return
 	}
 	log.Printf("启动时检测持仓，待检查 %d 个仓位", len(entries))
+	if tradeMgr.watchMgr != nil {
+		symbolSet := make(map[string]struct{}, len(entries))
+		for _, entry := range entries {
+			symbol := strings.ToUpper(entry.Symbol)
+			if symbol == "" {
+				continue
+			}
+			symbolSet[symbol] = struct{}{}
+		}
+		if len(symbolSet) > 0 {
+			symbols := make([]string, 0, len(symbolSet))
+			for sym := range symbolSet {
+				symbols = append(symbols, sym)
+			}
+			tradeMgr.watchMgr.EnsureWatchers(ctx, symbols)
+		}
+	}
 	if err := tradeMgr.CheckPositionExits(ctx); err != nil {
 		log.Printf("启动时持仓检查出现错误: %v", err)
 	}
@@ -1395,7 +1470,7 @@ func run(cfg config) error {
 		if err != nil {
 			return fmt.Errorf("获取当前持仓失败: %w", err)
 		}
-		tradeMgr = newTradeManager(binance, positions, cfg, httpClient)
+		tradeMgr = newTradeManager(binance, positions, cfg, httpClient, watchMgr)
 		log.Printf("当前持仓数量: %d / %d", tradeMgr.positions.Count(), cfg.maxPositions)
 		initializeExistingPositions(ctx, tradeMgr)
 	}
@@ -1472,7 +1547,22 @@ func run(cfg config) error {
 			}
 			actualWatchSymbols = append(actualWatchSymbols, upper)
 		}
-		if len(actualWatchSymbols) > 0 {
+		if tradeMgr != nil && tradeMgr.watchMgr != nil {
+			watchTargets := make(map[string]struct{}, len(actualWatchSymbols)+len(positionSet))
+			for _, sym := range actualWatchSymbols {
+				watchTargets[sym] = struct{}{}
+			}
+			for sym := range positionSet {
+				watchTargets[sym] = struct{}{}
+			}
+			if len(watchTargets) > 0 {
+				symbolsForWatch := make([]string, 0, len(watchTargets))
+				for sym := range watchTargets {
+					symbolsForWatch = append(symbolsForWatch, sym)
+				}
+				tradeMgr.watchMgr.EnsureWatchers(ctx, symbolsForWatch)
+			}
+		} else if len(actualWatchSymbols) > 0 {
 			watchMgr.EnsureWatchers(ctx, actualWatchSymbols)
 		}
 		strategies := watchMgr.EvaluateStrategies(actualWatchSymbols)
@@ -1527,10 +1617,11 @@ func run(cfg config) error {
 		}
 		strategyMap := make(map[string]strategyResult, len(symbols))
 		if len(symbols) > 0 {
+			if tradeMgr.watchMgr != nil {
+				tradeMgr.watchMgr.EnsureWatchers(parent, symbols)
+			}
 			for _, sym := range symbols {
-				ctxSymbol, cancel := context.WithTimeout(ctxStatus, 45*time.Second)
-				sr, err := computeStrategyForSymbol(ctxSymbol, tradeMgr.httpClient, sym, cfg)
-				cancel()
+				sr, err := computeStrategyForSymbol(ctxStatus, tradeMgr.watchMgr, sym, cfg)
 				if err != nil {
 					log.Printf("获取持仓 %s 策略数据失败: %v", sym, err)
 					continue
@@ -1803,7 +1894,7 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 		}
 	}
 	b.WriteString("\n")
-	b.WriteString("5m 策略监控 (EMA/MACD/ADX)：\n")
+	b.WriteString("策略监控 (1m & 5m EMA/MACD/ADX)：\n")
 	if len(strategies) == 0 {
 		b.WriteString("暂无监听数据或数据不足\n")
 	} else {
@@ -1816,20 +1907,15 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 			if sr.ShortSignal {
 				shortStatus = "S✅"
 			}
-			b.WriteString(fmt.Sprintf("%s/%s %-10s 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% EMA快:%0.4f(Δ%0.4f) EMA慢:%0.4f(Δ%0.4f) MACD_H:%0.4f→%0.4f ADX:%0.2f%s\n",
+			b.WriteString(fmt.Sprintf("%s/%s %-10s 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s\n",
 				longStatus,
 				shortStatus,
 				sr.Symbol,
 				sr.Metrics.Change30m,
 				sr.Metrics.Change10m,
 				sr.Metrics.AvgAmplitude,
-				sr.EMAFast,
-				sr.EMAFastSlope,
-				sr.EMASlow,
-				sr.EMASlowSlope,
-				sr.MACDHist,
-				sr.MACDPrev,
-				sr.ADX,
+				summarizeTimeframe(sr.FiveMinute),
+				summarizeTimeframe(sr.OneMinute),
 				formatQtyInfo(qtyMap, sr.Symbol),
 			))
 		}
@@ -1848,6 +1934,19 @@ func formatQtyInfo(qtyMap map[string]float64, symbol string) string {
 	return fmt.Sprintf(" Qty:%s", formatQuantity(q))
 }
 
+func summarizeTimeframe(tf timeframeAnalysis) string {
+	return fmt.Sprintf("%s EMA快:%0.4f(Δ%+0.4f) EMA慢:%0.4f(Δ%+0.4f) MACD_H:%+0.4f→%+0.4f ADX:%0.2f",
+		tf.Interval,
+		tf.EMAFast,
+		tf.EMAFastSlope,
+		tf.EMASlow,
+		tf.EMASlowSlope,
+		tf.MACDHist,
+		tf.MACDPrev,
+		tf.ADX,
+	)
+}
+
 func buildSignalAlerts(strategies []strategyResult, qtyMap map[string]float64) string {
 	if len(strategies) == 0 {
 		return ""
@@ -1859,10 +1958,28 @@ func buildSignalAlerts(strategies []strategyResult, qtyMap map[string]float64) s
 		}
 		qtyInfo := formatQtyInfo(qtyMap, sr.Symbol)
 		if sr.LongSignal {
-			lines = append(lines, fmt.Sprintf("[开多] %s%s 30m:%+.4f%% 10m:%+.4f%% MACD_H:%+.4f ADX:%.2f", sr.Symbol, qtyInfo, sr.Metrics.Change30m, sr.Metrics.Change10m, sr.MACDHist, sr.ADX))
+			lines = append(lines, fmt.Sprintf("[开多] %s%s 30m:%+.4f%% 10m:%+.4f%% 5m MACD_H:%+.4f ADX:%.2f | 1m MACD_H:%+.4f ADX:%.2f",
+				sr.Symbol,
+				qtyInfo,
+				sr.Metrics.Change30m,
+				sr.Metrics.Change10m,
+				sr.FiveMinute.MACDHist,
+				sr.FiveMinute.ADX,
+				sr.OneMinute.MACDHist,
+				sr.OneMinute.ADX,
+			))
 		}
 		if sr.ShortSignal {
-			lines = append(lines, fmt.Sprintf("[开空] %s%s 30m:%+.4f%% 10m:%+.4f%% MACD_H:%+.4f ADX:%.2f", sr.Symbol, qtyInfo, sr.Metrics.Change30m, sr.Metrics.Change10m, sr.MACDHist, sr.ADX))
+			lines = append(lines, fmt.Sprintf("[开空] %s%s 30m:%+.4f%% 10m:%+.4f%% 5m MACD_H:%+.4f ADX:%.2f | 1m MACD_H:%+.4f ADX:%.2f",
+				sr.Symbol,
+				qtyInfo,
+				sr.Metrics.Change30m,
+				sr.Metrics.Change10m,
+				sr.FiveMinute.MACDHist,
+				sr.FiveMinute.ADX,
+				sr.OneMinute.MACDHist,
+				sr.OneMinute.ADX,
+			))
 		}
 	}
 	if len(lines) == 0 {
@@ -1903,20 +2020,15 @@ func buildPositionStatusMessage(now time.Time, entries []positionEntry, srMap ma
 				shortStatus = "S✅"
 			}
 			b.WriteString(fmt.Sprintf(
-				"%-12s %-5s Qty:%s %s/%s Last:%0.6f EMA快:%0.4f(Δ%+0.4f) EMA慢:%0.4f(Δ%+0.4f) MACD_H:%+0.4f→%+0.4f ADX:%0.2f 30m:%+0.2f%% 10m:%+0.2f%%\n",
+				"%-12s %-5s Qty:%s %s/%s Last:%0.6f | %s | %s 30m:%+0.2f%% 10m:%+0.2f%%\n",
 				symbol,
 				entry.Side,
 				qtyText,
 				longStatus,
 				shortStatus,
 				sr.Metrics.Last,
-				sr.EMAFast,
-				sr.EMAFastSlope,
-				sr.EMASlow,
-				sr.EMASlowSlope,
-				sr.MACDHist,
-				sr.MACDPrev,
-				sr.ADX,
+				summarizeTimeframe(sr.FiveMinute),
+				summarizeTimeframe(sr.OneMinute),
 				sr.Metrics.Change30m,
 				sr.Metrics.Change10m,
 			))
@@ -1979,15 +2091,93 @@ func sendTelegramMessage(ctx context.Context, c *http.Client, token, chatID, tex
 	return nil
 }
 
+func computeTimeframeAnalysis(interval string, candles []candle, cfg config) (timeframeAnalysis, error) {
+	analysis := timeframeAnalysis{Interval: interval}
+	clean := dedupeCandles(candles)
+	if len(clean) == 0 {
+		return analysis, errors.New("K线数据为空")
+	}
+
+	// Ensure enough data for EMA/MACD calculations
+	required := cfg.emaSlowPeriod
+	if cfg.macdSlowPeriod > required {
+		required = cfg.macdSlowPeriod
+	}
+	if cfg.macdSignalPeriod > required {
+		required = cfg.macdSignalPeriod
+	}
+	if len(clean) < required+1 {
+		return analysis, errors.New("K线数据不足以计算指标")
+	}
+
+	closes := make([]float64, 0, len(clean))
+	for _, c := range clean {
+		closes = append(closes, c.Close)
+	}
+
+	emaFast := emaSeries(closes, cfg.emaFastPeriod)
+	emaSlow := emaSeries(closes, cfg.emaSlowPeriod)
+	if len(emaFast) == 0 || len(emaSlow) == 0 {
+		return analysis, errors.New("EMA 数据不足")
+	}
+	lastIdx := len(closes) - 1
+	if lastIdx < 1 {
+		return analysis, errors.New("K线不足以获取EMA斜率")
+	}
+
+	fastCurrent := emaFast[lastIdx]
+	fastPrev := emaFast[lastIdx-1]
+	slowCurrent := emaSlow[lastIdx]
+	slowPrev := emaSlow[lastIdx-1]
+
+	macdFastSeries := emaSeries(closes, cfg.macdFastPeriod)
+	macdSlowSeries := emaSeries(closes, cfg.macdSlowPeriod)
+	if len(macdFastSeries) == 0 || len(macdSlowSeries) == 0 {
+		return analysis, errors.New("MACD EMA 数据不足")
+	}
+	macdLine := make([]float64, len(closes))
+	for i := range macdLine {
+		macdLine[i] = macdFastSeries[i] - macdSlowSeries[i]
+	}
+	macdSignalSeries := emaSeries(macdLine, cfg.macdSignalPeriod)
+	if len(macdSignalSeries) == 0 {
+		return analysis, errors.New("MACD 信号线数据不足")
+	}
+	macdCurrent := macdLine[lastIdx]
+	macdPrev := macdLine[lastIdx-1]
+	signalCurrent := macdSignalSeries[lastIdx]
+	signalPrev := macdSignalSeries[lastIdx-1]
+	macdHist := macdCurrent - signalCurrent
+	macdHistPrev := macdPrev - signalPrev
+
+	adxVal, err := computeADX(clean, cfg.adxPeriod)
+	if err != nil {
+		return analysis, err
+	}
+
+	analysis.EMAFast = fastCurrent
+	analysis.EMASlow = slowCurrent
+	analysis.EMAFastSlope = fastCurrent - fastPrev
+	analysis.EMASlowSlope = slowCurrent - slowPrev
+	analysis.MACDHist = macdHist
+	analysis.MACDPrev = macdHistPrev
+	analysis.ADX = adxVal
+	analysis.LongSignal = fastCurrent > slowCurrent && analysis.EMAFastSlope > 0 && analysis.EMASlowSlope > 0 && macdHist > 0 && macdHist > macdHistPrev && adxVal > cfg.adxThreshold
+	analysis.ShortSignal = fastCurrent < slowCurrent && analysis.EMAFastSlope < 0 && analysis.EMASlowSlope < 0 && macdHist < 0 && macdHist < macdHistPrev && adxVal > cfg.adxThreshold
+	return analysis, nil
+}
+
 func computeStrategyFromCandles(symbol string, candles []candle, cfg config) (strategyResult, error) {
 	result := strategyResult{Symbol: symbol}
-	if len(candles) < 121 {
+	clean := dedupeCandles(candles)
+	if len(clean) < 121 {
 		return result, errors.New("1m K线不足 121 条")
 	}
-	closes := make([]float64, 0, len(candles))
-	highs := make([]float64, 0, len(candles))
-	lows := make([]float64, 0, len(candles))
-	for _, cndl := range candles {
+
+	closes := make([]float64, 0, len(clean))
+	highs := make([]float64, 0, len(clean))
+	lows := make([]float64, 0, len(clean))
+	for _, cndl := range clean {
 		closes = append(closes, cndl.Close)
 		highs = append(highs, cndl.High)
 		lows = append(lows, cndl.Low)
@@ -1999,72 +2189,21 @@ func computeStrategyFromCandles(symbol string, candles []candle, cfg config) (st
 	}
 	result.Metrics = metrics
 
-	fiveMinute := aggregateTo5m(candles)
-	required := cfg.emaSlowPeriod
-	if cfg.macdSlowPeriod > required {
-		required = cfg.macdSlowPeriod
-	}
-	if cfg.macdSignalPeriod > required {
-		required = cfg.macdSignalPeriod
-	}
-	if len(fiveMinute) < required+1 {
-		return result, errors.New("5m K线不足以计算EMA/MACD")
-	}
-	closes5m := make([]float64, 0, len(fiveMinute))
-	for _, cndl := range fiveMinute {
-		closes5m = append(closes5m, cndl.Close)
-	}
-
-	emaFast := emaSeries(closes5m, cfg.emaFastPeriod)
-	emaSlow := emaSeries(closes5m, cfg.emaSlowPeriod)
-	if len(emaFast) == 0 || len(emaSlow) == 0 {
-		return result, errors.New("EMA 数据不足")
-	}
-	lastIdx := len(closes5m) - 1
-	if lastIdx < 1 {
-		return result, errors.New("5m K线不足以获取斜率")
-	}
-	fastCurrent := emaFast[lastIdx]
-	fastPrev := emaFast[lastIdx-1]
-	slowCurrent := emaSlow[lastIdx]
-	slowPrev := emaSlow[lastIdx-1]
-	result.EMAFast = fastCurrent
-	result.EMASlow = slowCurrent
-	result.EMAFastSlope = fastCurrent - fastPrev
-	result.EMASlowSlope = slowCurrent - slowPrev
-
-	macdFastSeries := emaSeries(closes5m, cfg.macdFastPeriod)
-	macdSlowSeries := emaSeries(closes5m, cfg.macdSlowPeriod)
-	if len(macdFastSeries) == 0 || len(macdSlowSeries) == 0 {
-		return result, errors.New("MACD EMA 数据不足")
-	}
-	macdLine := make([]float64, len(closes5m))
-	for i := range macdLine {
-		macdLine[i] = macdFastSeries[i] - macdSlowSeries[i]
-	}
-	macdSignalSeries := emaSeries(macdLine, cfg.macdSignalPeriod)
-	if len(macdSignalSeries) == 0 {
-		return result, errors.New("MACD 信号线数据不足")
-	}
-	macdCurrent := macdLine[lastIdx]
-	macdPrev := macdLine[lastIdx-1]
-	signalCurrent := macdSignalSeries[lastIdx]
-	signalPrev := macdSignalSeries[lastIdx-1]
-	macdHist := macdCurrent - signalCurrent
-	macdHistPrev := macdPrev - signalPrev
-	result.MACDHist = macdHist
-	result.MACDPrev = macdHistPrev
-
-	adxVal, err := computeADX(fiveMinute, cfg.adxPeriod)
+	oneMinute, err := computeTimeframeAnalysis("1m", clean, cfg)
 	if err != nil {
 		return result, err
 	}
-	result.ADX = adxVal
 
-	longSignal := fastCurrent > slowCurrent && result.EMAFastSlope > 0 && result.EMASlowSlope > 0 && macdHist > 0 && macdHist > macdHistPrev && adxVal > cfg.adxThreshold
-	shortSignal := fastCurrent < slowCurrent && result.EMAFastSlope < 0 && result.EMASlowSlope < 0 && macdHist < 0 && macdHist < macdHistPrev && adxVal > cfg.adxThreshold
-	result.LongSignal = longSignal
-	result.ShortSignal = shortSignal
+	fiveMinuteCandles := aggregateTo5m(clean)
+	fiveMinute, err := computeTimeframeAnalysis("5m", fiveMinuteCandles, cfg)
+	if err != nil {
+		return result, err
+	}
+
+	result.OneMinute = oneMinute
+	result.FiveMinute = fiveMinute
+	result.LongSignal = oneMinute.LongSignal && fiveMinute.LongSignal
+	result.ShortSignal = oneMinute.ShortSignal && fiveMinute.ShortSignal
 	return result, nil
 }
 
