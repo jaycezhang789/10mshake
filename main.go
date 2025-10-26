@@ -1990,6 +1990,15 @@ func (tm *tradeManager) handleCandleUpdate(symbol, interval string) {
 		log.Printf("获取 %s 策略数据失败: %v", symbol, err)
 	} else {
 		tm.storeSnapshot(sr)
+		log.Printf("WS 收盘触发 %s %s：Score %.4f | LongSignal=%t | ShortSignal=%t | Last3=%s | Last5=%s",
+			symbol,
+			strings.ToUpper(interval),
+			sr.Score,
+			sr.LongSignal,
+			sr.ShortSignal,
+			sr.Last3mBarID,
+			sr.Last5mBarID,
+		)
 		if err := tm.checkPositionForSymbol(ctx, symbol, &sr); err != nil {
 			log.Printf("基于3m更新检查持仓失败 %s: %v", symbol, err)
 		}
@@ -2521,71 +2530,8 @@ func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategy
 
 	for i := range strategies {
 		sr := strategies[i]
-		if sr.Score <= 0 {
-			continue
-		}
-		tm.updateReentryReset(sr.Symbol, "LONG", sr)
-		tm.updateReentryReset(sr.Symbol, "SHORT", sr)
-		if tm.positions.Remaining() <= 0 {
-			break
-		}
-		price := sr.Metrics.Last
-		if price <= 0 {
-			continue
-		}
-		key := sr.Last3mBarID + "::" + sr.Last5mBarID
-		if key != "::" && !tm.shouldEvaluateSymbolKey(sr.Symbol, key) {
-			if snap, ok := tm.getSnapshot(sr.Symbol); ok {
-				sr.EntryBlocked = snap.EntryBlocked
-				sr.BlockReasons = snap.BlockReasons
-				sr.SpreadRatio = snap.SpreadRatio
-				sr.DepthNotional = snap.DepthNotional
-			}
-			strategies[i] = sr
-			continue
-		}
-		if !tm.evaluateEntryEnvironment(ctx, &sr) {
-			strategies[i] = sr
-			if len(sr.BlockReasons) > 0 {
-				log.Printf("%s 环境不满足开仓: %s", sr.Symbol, strings.Join(sr.BlockReasons, "; "))
-			}
-			continue
-		}
-		tm.storeSnapshot(sr)
-		if sr.LongSignal && !tm.positions.Has(sr.Symbol, "LONG") {
-			if !tm.canEnterAfterReset(sr.Symbol, "LONG", sr) {
-				if tm.isRecentlyClosed(sr.Symbol, "LONG") {
-					sr.BlockReasons = append(sr.BlockReasons, "最近平仓冷却中")
-				}
-				strategies[i] = sr
-				goto shortCheckLabel
-			}
-			if err := tm.openPosition(ctx, sr.Symbol, "LONG", price); err != nil {
-				log.Printf("开多单失败 %s: %v", sr.Symbol, err)
-				tm.notifyError(ctx, fmt.Sprintf("开多失败 %s: %v", sr.Symbol, err))
-			} else {
-				tm.clearReentryState(sr.Symbol, "LONG")
-			}
-		}
-	shortCheckLabel:
-		if tm.positions.Remaining() <= 0 {
-			strategies[i] = sr
-			break
-		}
-		if sr.ShortSignal && !tm.positions.Has(sr.Symbol, "SHORT") {
-			if !tm.canEnterAfterReset(sr.Symbol, "SHORT", sr) {
-				if tm.isRecentlyClosed(sr.Symbol, "SHORT") {
-					sr.BlockReasons = append(sr.BlockReasons, "最近平仓冷却中")
-				}
-				strategies[i] = sr
-				continue
-			}
-			if err := tm.openPosition(ctx, sr.Symbol, "SHORT", price); err != nil {
-				log.Printf("开空单失败 %s: %v", sr.Symbol, err)
-				tm.notifyError(ctx, fmt.Sprintf("开空失败 %s: %v", sr.Symbol, err))
-			} else {
-				tm.clearReentryState(sr.Symbol, "SHORT")
-			}
+		if err := tm.evaluateOpenForSymbol(ctx, sr.Symbol, &sr); err != nil {
+			log.Printf("评估 %s 失败: %v", sr.Symbol, err)
 		}
 		strategies[i] = sr
 	}
