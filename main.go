@@ -92,7 +92,7 @@ type timeframeAnalysis struct {
 type strategyResult struct {
 	Symbol      string
 	Metrics     symbolMetrics
-	OneMinute   timeframeAnalysis
+	ThreeMinute timeframeAnalysis
 	FiveMinute  timeframeAnalysis
 	LongSignal  bool
 	ShortSignal bool
@@ -862,10 +862,10 @@ func (tm *tradeManager) handleCandleUpdate(symbol string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := tm.checkPositionForSymbol(ctx, symbol); err != nil {
-		log.Printf("基于1m更新检查持仓失败 %s: %v", symbol, err)
+		log.Printf("基于3m更新检查持仓失败 %s: %v", symbol, err)
 	}
 	if err := tm.evaluateOpenForSymbol(ctx, symbol); err != nil {
-		log.Printf("基于1m更新评估开仓失败 %s: %v", symbol, err)
+		log.Printf("基于3m更新评估开仓失败 %s: %v", symbol, err)
 	}
 }
 
@@ -894,7 +894,7 @@ func (tm *tradeManager) checkPositionForSymbol(ctx context.Context, symbol strin
 	var firstErr error
 	if hasLong && shouldClosePosition("LONG", sr) {
 		if err := tm.closePosition(ctx, symbol, "LONG"); err != nil {
-			log.Printf("1m 平多失败 %s: %v", symbol, err)
+			log.Printf("3m 平多失败 %s: %v", symbol, err)
 			tm.notifyError(ctx, fmt.Sprintf("平多失败 %s: %v", symbol, err))
 			if firstErr == nil {
 				firstErr = err
@@ -903,7 +903,7 @@ func (tm *tradeManager) checkPositionForSymbol(ctx context.Context, symbol strin
 	}
 	if hasShort && shouldClosePosition("SHORT", sr) {
 		if err := tm.closePosition(ctx, symbol, "SHORT"); err != nil {
-			log.Printf("1m 平空失败 %s: %v", symbol, err)
+			log.Printf("3m 平空失败 %s: %v", symbol, err)
 			tm.notifyError(ctx, fmt.Sprintf("平空失败 %s: %v", symbol, err))
 			if firstErr == nil {
 				firstErr = err
@@ -954,7 +954,7 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 }
 
 func shouldClosePosition(side string, sr strategyResult) bool {
-	tf := sr.OneMinute
+	tf := sr.ThreeMinute
 	switch strings.ToUpper(side) {
 	case "LONG":
 		return tf.EMAFast <= tf.EMASlow || tf.MACDHist <= 0
@@ -1009,7 +1009,7 @@ func (tm *tradeManager) CheckPositionExits(ctx context.Context) error {
 		return nil
 	}
 
-	log.Printf("开始 5m 持仓检查，当前持仓数: %d", len(entries))
+	log.Printf("开始持仓检查，当前持仓数: %d", len(entries))
 	if tm.watchMgr != nil {
 		symbolSet := make(map[string]struct{}, len(entries))
 		for _, entry := range entries {
@@ -1953,7 +1953,7 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 				sr.Metrics.Change10m,
 				sr.Metrics.AvgAmplitude,
 				summarizeTimeframe(sr.FiveMinute),
-				summarizeTimeframe(sr.OneMinute),
+				summarizeTimeframe(sr.ThreeMinute),
 				formatQtyInfo(qtyMap, sr.Symbol),
 			))
 		}
@@ -1965,7 +1965,7 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 				sr.Metrics.Change10m,
 				sr.Metrics.AvgAmplitude,
 				summarizeTimeframe(sr.FiveMinute),
-				summarizeTimeframe(sr.OneMinute),
+				summarizeTimeframe(sr.ThreeMinute),
 				formatQtyInfo(qtyMap, sr.Symbol),
 			))
 		}
@@ -2028,27 +2028,27 @@ func buildSignalAlerts(strategies []strategyResult, qtyMap map[string]float64) s
 		}
 		qtyInfo := formatQtyInfo(qtyMap, sr.Symbol)
 		if sr.LongSignal {
-			lines = append(lines, fmt.Sprintf("[开多] %s%s 30m:%+.4f%% 10m:%+.4f%% 5m MACD_H:%+.4f ADX:%.2f | 1m MACD_H:%+.4f ADX:%.2f",
+			lines = append(lines, fmt.Sprintf("[开多] %s%s 30m:%+.4f%% 10m:%+.4f%% 5m MACD_H:%+.4f ADX:%.2f | 3m MACD_H:%+.4f ADX:%.2f",
 				sr.Symbol,
 				qtyInfo,
 				sr.Metrics.Change30m,
 				sr.Metrics.Change10m,
 				sr.FiveMinute.MACDHist,
 				sr.FiveMinute.ADX,
-				sr.OneMinute.MACDHist,
-				sr.OneMinute.ADX,
+				sr.ThreeMinute.MACDHist,
+				sr.ThreeMinute.ADX,
 			))
 		}
 		if sr.ShortSignal {
-			lines = append(lines, fmt.Sprintf("[开空] %s%s 30m:%+.4f%% 10m:%+.4f%% 5m MACD_H:%+.4f ADX:%.2f | 1m MACD_H:%+.4f ADX:%.2f",
+			lines = append(lines, fmt.Sprintf("[开空] %s%s 30m:%+.4f%% 10m:%+.4f%% 5m MACD_H:%+.4f ADX:%.2f | 3m MACD_H:%+.4f ADX:%.2f",
 				sr.Symbol,
 				qtyInfo,
 				sr.Metrics.Change30m,
 				sr.Metrics.Change10m,
 				sr.FiveMinute.MACDHist,
 				sr.FiveMinute.ADX,
-				sr.OneMinute.MACDHist,
-				sr.OneMinute.ADX,
+				sr.ThreeMinute.MACDHist,
+				sr.ThreeMinute.ADX,
 			))
 		}
 	}
@@ -2098,7 +2098,7 @@ func buildPositionStatusMessage(now time.Time, entries []positionEntry, srMap ma
 				shortStatus,
 				sr.Metrics.Last,
 				summarizeTimeframe(sr.FiveMinute),
-				summarizeTimeframe(sr.OneMinute),
+				summarizeTimeframe(sr.ThreeMinute),
 				sr.Metrics.Change30m,
 				sr.Metrics.Change10m,
 			))
@@ -2244,22 +2244,17 @@ func computeStrategyFromCandles(symbol string, candles []candle, cfg config) (st
 		return result, errors.New("1m K线不足 121 条")
 	}
 
-	closes := make([]float64, 0, len(clean))
-	highs := make([]float64, 0, len(clean))
-	lows := make([]float64, 0, len(clean))
-	for _, cndl := range clean {
-		closes = append(closes, cndl.Close)
-		highs = append(highs, cndl.High)
-		lows = append(lows, cndl.Low)
-	}
-
-	metrics, err := computeMetricsFromSeries(symbol, closes, highs, lows)
+	metrics, err := computeMetricsFromCandles(symbol, clean)
 	if err != nil {
 		return result, err
 	}
 	result.Metrics = metrics
 
-	oneMinute, err := computeTimeframeAnalysis("1m", clean, cfg)
+	threeMinuteCandles := aggregateToInterval(clean, 3*time.Minute)
+	if len(threeMinuteCandles) == 0 {
+		return result, errors.New("3m K线数据不足")
+	}
+	threeMinute, err := computeTimeframeAnalysis("3m", threeMinuteCandles, cfg)
 	if err != nil {
 		return result, err
 	}
@@ -2270,61 +2265,53 @@ func computeStrategyFromCandles(symbol string, candles []candle, cfg config) (st
 		return result, err
 	}
 
-	result.OneMinute = oneMinute
+	result.ThreeMinute = threeMinute
 	result.FiveMinute = fiveMinute
-	result.LongSignal = oneMinute.LongSignal && fiveMinute.LongSignal
-	result.ShortSignal = oneMinute.ShortSignal && fiveMinute.ShortSignal
+	result.LongSignal = threeMinute.LongSignal && fiveMinute.LongSignal
+	result.ShortSignal = threeMinute.ShortSignal && fiveMinute.ShortSignal
 	return result, nil
 }
 
 func fetchSymbolMetrics(ctx context.Context, c *http.Client, symbol string) (symbolMetrics, error) {
 	metrics := symbolMetrics{Symbol: symbol}
-	url := fmt.Sprintf("%s%s?symbol=%s&interval=1m&limit=499", baseURL, klinesEP, symbol)
-	var raw [][]interface{}
-	if err := getJSON(ctx, c, url, &raw); err != nil {
+	candles, err := fetchHistorical1m(ctx, c, symbol, positionKlineLimit)
+	if err != nil {
 		return metrics, err
 	}
-	if len(raw) < 121 {
+	if len(candles) == 0 {
 		return metrics, errors.New("K线数据不足")
 	}
-
-	closes := make([]float64, 0, len(raw))
-	highs := make([]float64, 0, len(raw))
-	lows := make([]float64, 0, len(raw))
-	for _, row := range raw {
-		if len(row) < 6 {
-			continue
-		}
-		closeVal := parseStringFloat(row[4])
-		highVal := parseStringFloat(row[2])
-		lowVal := parseStringFloat(row[3])
-		if math.IsNaN(closeVal) || math.IsNaN(highVal) || math.IsNaN(lowVal) {
-			continue
-		}
-		closes = append(closes, closeVal)
-		highs = append(highs, highVal)
-		lows = append(lows, lowVal)
-	}
-
-	return computeMetricsFromSeries(symbol, closes, highs, lows)
+	return computeMetricsFromCandles(symbol, candles)
 }
 
-func computeMetricsFromSeries(symbol string, closes, highs, lows []float64) (symbolMetrics, error) {
+func computeMetricsFromCandles(symbol string, candles []candle) (symbolMetrics, error) {
 	metrics := symbolMetrics{Symbol: symbol}
-	if len(closes) < 121 || len(highs) < len(closes) || len(lows) < len(closes) {
+	if len(candles) < 121 {
 		return metrics, errors.New("K线数据不足")
 	}
-	metrics.Last = closes[len(closes)-1]
+	clean := dedupeCandles(candles)
+	if len(clean) < 121 {
+		return metrics, errors.New("K线数据不足")
+	}
+	metrics.Last = clean[len(clean)-1].Close
+	highs := make([]float64, len(clean))
+	lows := make([]float64, len(clean))
+	for i, c := range clean {
+		highs[i] = c.High
+		lows[i] = c.Low
+	}
 	calcChange := func(minutes int) (float64, error) {
-		idx := len(closes) - (minutes + 1)
-		if idx < 0 || idx >= len(closes) {
-			return 0, errors.New("数据不足")
+		target := clean[len(clean)-1].CloseTime.Add(-time.Duration(minutes) * time.Minute)
+		for i := len(clean) - 1; i >= 0; i-- {
+			if !clean[i].CloseTime.After(target) {
+				prev := clean[i].Close
+				if prev == 0 {
+					return 0, errors.New("前值为0")
+				}
+				return (metrics.Last - prev) / prev * 100.0, nil
+			}
 		}
-		prev := closes[idx]
-		if prev == 0 {
-			return 0, errors.New("前值为0")
-		}
-		return (metrics.Last - prev) / prev * 100.0, nil
+		return 0, errors.New("数据不足")
 	}
 	var err error
 	if metrics.Change10m, err = calcChange(10); err != nil {
@@ -2343,25 +2330,25 @@ func computeMetricsFromSeries(symbol string, closes, highs, lows []float64) (sym
 	return metrics, nil
 }
 
-func aggregateTo5m(candles []candle) []candle {
+func aggregateToInterval(candles []candle, interval time.Duration) []candle {
 	if len(candles) == 0 {
 		return nil
 	}
-	aggregated := make([]candle, 0, len(candles)/5+1)
+	aggregated := make([]candle, 0, len(candles)/int(interval/time.Minute)+1)
 	var current candle
 	var bucket time.Time
-	count := 0
-	lastIdx := len(candles) - 1
-	for idx, c := range candles {
-		b := c.OpenTime.Truncate(5 * time.Minute)
+	var count int
+	var lastClose time.Time
+	for _, c := range candles {
+		b := c.OpenTime.Truncate(interval)
 		if count == 0 || !b.Equal(bucket) {
-			if count > 0 {
+			if count > 0 && !lastClose.Before(bucket.Add(interval)) {
 				aggregated = append(aggregated, current)
 			}
 			bucket = b
 			current = candle{
 				OpenTime:  b,
-				CloseTime: b.Add(5 * time.Minute),
+				CloseTime: b.Add(interval),
 				Open:      c.Open,
 				High:      c.High,
 				Low:       c.Low,
@@ -2369,24 +2356,28 @@ func aggregateTo5m(candles []candle) []candle {
 				Volume:    c.Volume,
 			}
 			count = 1
-		} else {
-			if c.High > current.High {
-				current.High = c.High
-			}
-			if c.Low < current.Low {
-				current.Low = c.Low
-			}
-			current.Close = c.Close
-			current.Volume += c.Volume
-			count++
+			lastClose = c.CloseTime
+			continue
 		}
-		if idx == lastIdx {
-			if count >= 5 || c.OpenTime.Sub(bucket) >= 4*time.Minute {
-				aggregated = append(aggregated, current)
-			}
+		if c.High > current.High {
+			current.High = c.High
 		}
+		if c.Low < current.Low {
+			current.Low = c.Low
+		}
+		current.Close = c.Close
+		current.Volume += c.Volume
+		lastClose = c.CloseTime
+		count++
+	}
+	if count > 0 && !lastClose.Before(bucket.Add(interval)) {
+		aggregated = append(aggregated, current)
 	}
 	return aggregated
+}
+
+func aggregateTo5m(candles []candle) []candle {
+	return aggregateToInterval(candles, 5*time.Minute)
 }
 
 func emaSeries(values []float64, period int) []float64 {
