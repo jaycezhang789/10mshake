@@ -48,7 +48,6 @@ const (
 	choppinessThreshold         = 61.0
 	choppinessAdxMax            = 18.0
 	spreadAtrThreshold          = 0.07
-	depthNotionalThreshold      = 200000.0
 	btcVolMultiplier            = 3.0
 	btcCooloffDuration          = 15 * time.Minute
 )
@@ -1846,10 +1845,6 @@ func (tm *tradeManager) assessSpreadAndDepth(ctx context.Context, sr *strategyRe
 	if sr.SpreadRatio > spreadAtrThreshold {
 		allowed = false
 		sr.BlockReasons = append(sr.BlockReasons, fmt.Sprintf("点差占比 %.3f 超阈值 %.2f", sr.SpreadRatio, spreadAtrThreshold))
-	}
-	if depth < depthNotionalThreshold {
-		allowed = false
-		sr.BlockReasons = append(sr.BlockReasons, fmt.Sprintf("深度 %.0f < %.0f", depth, depthNotionalThreshold))
 	}
 	return allowed
 }
