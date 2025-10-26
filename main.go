@@ -38,7 +38,6 @@ const (
 const (
 	initialKlineLimit  = 499
 	positionKlineLimit = 499
-	max1mCandles       = 2000
 )
 
 type exchangeInfoResp struct {
@@ -99,21 +98,23 @@ type strategyResult struct {
 	Score       float64
 }
 
-type symbolWatcher struct {
+type intervalWatcher struct {
 	symbol   string
+	interval string
+	duration time.Duration
 	mu       sync.RWMutex
 	candles  []candle
 	cancel   context.CancelFunc
 	done     chan struct{}
-	onCandle func(string)
+	onCandle func(string, string)
 }
 
 type symbolManager struct {
 	mu       sync.RWMutex
-	watchers map[string]*symbolWatcher
+	watchers map[string]map[string]*intervalWatcher
 	client   *http.Client
 	cfg      config
-	onCandle func(string)
+	onCandle func(string, string)
 }
 
 type symbolFilter struct {
@@ -136,6 +137,14 @@ type wsKlineEvent struct {
 		Volume    string `json:"v"`
 		Final     bool   `json:"x"`
 	} `json:"k"`
+}
+
+var intervalConfigs = []struct {
+	Name     string
+	Duration time.Duration
+}{
+	{"3m", 3 * time.Minute},
+	{"5m", 5 * time.Minute},
 }
 
 func (e wsKlineEvent) toCandle() (candle, error) {
@@ -178,97 +187,15 @@ func (e wsKlineEvent) toCandle() (candle, error) {
 }
 
 func newSymbolManager(client *http.Client, cfg config) *symbolManager {
+	watchers := make(map[string]map[string]*intervalWatcher)
+	for _, iv := range intervalConfigs {
+		watchers[iv.Name] = make(map[string]*intervalWatcher)
+	}
 	return &symbolManager{
-		watchers: make(map[string]*symbolWatcher),
+		watchers: watchers,
 		client:   client,
 		cfg:      cfg,
 		onCandle: nil,
-	}
-}
-
-func (m *symbolManager) EnsureWatchers(ctx context.Context, symbols []string) {
-	for _, sym := range symbols {
-		sym = strings.ToUpper(sym)
-		if sym == "" {
-			continue
-		}
-		m.mu.RLock()
-		wExisting, exists := m.watchers[sym]
-		m.mu.RUnlock()
-		if exists {
-			wExisting.setHandler(m.onCandle)
-			continue
-		}
-
-		ctxTimeout, cancel := context.WithTimeout(ctx, 30*time.Second)
-		candles, err := fetchHistorical1m(ctxTimeout, m.client, sym, initialKlineLimit)
-		cancel()
-		if err != nil {
-			log.Printf("初始化 %s 监听失败: %v", sym, err)
-			continue
-		}
-
-		watcher := newSymbolWatcher(sym, candles, m.onCandle)
-
-		m.mu.Lock()
-		if _, exists := m.watchers[sym]; exists {
-			m.mu.Unlock()
-			continue
-		}
-		m.watchers[sym] = watcher
-		m.mu.Unlock()
-
-		watcher.start(ctx)
-		log.Printf("开始监听 %s，初始1m K线: %d 条", sym, len(candles))
-	}
-}
-
-func (m *symbolManager) getWatcher(symbol string) *symbolWatcher {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.watchers[strings.ToUpper(symbol)]
-}
-
-func (m *symbolManager) SetCandleHandler(handler func(string)) {
-	m.mu.Lock()
-	m.onCandle = handler
-	for _, w := range m.watchers {
-		w.setHandler(handler)
-	}
-	m.mu.Unlock()
-}
-
-func (m *symbolManager) EvaluateStrategies(symbols []string) []strategyResult {
-	results := make([]strategyResult, 0, len(symbols))
-	for _, sym := range symbols {
-		w := m.getWatcher(sym)
-		if w == nil {
-			continue
-		}
-		candles := w.snapshot()
-		if len(candles) == 0 {
-			continue
-		}
-		rs, err := computeStrategyFromCandles(sym, candles, m.cfg)
-		if err != nil {
-			log.Printf("策略计算失败 %s: %v", sym, err)
-			continue
-		}
-		results = append(results, rs)
-	}
-	return results
-}
-
-func (m *symbolManager) Close() {
-	m.mu.Lock()
-	watchers := make([]*symbolWatcher, 0, len(m.watchers))
-	for _, w := range m.watchers {
-		watchers = append(watchers, w)
-	}
-	m.watchers = make(map[string]*symbolWatcher)
-	m.mu.Unlock()
-	for _, w := range watchers {
-		w.Close()
 	}
 }
 
@@ -294,31 +221,33 @@ func dedupeCandles(candles []candle) []candle {
 	return result
 }
 
-func newSymbolWatcher(symbol string, candles []candle, handler func(string)) *symbolWatcher {
+func newIntervalWatcher(symbol, interval string, duration time.Duration, candles []candle, handler func(string, string)) *intervalWatcher {
 	clean := dedupeCandles(candles)
 	copyCandles := make([]candle, len(clean))
 	copy(copyCandles, clean)
-	return &symbolWatcher{
+	return &intervalWatcher{
 		symbol:   symbol,
+		interval: strings.ToLower(interval),
+		duration: duration,
 		candles:  copyCandles,
 		done:     make(chan struct{}),
 		onCandle: handler,
 	}
 }
 
-func (w *symbolWatcher) setHandler(handler func(string)) {
+func (w *intervalWatcher) setHandler(handler func(string, string)) {
 	w.mu.Lock()
 	w.onCandle = handler
 	w.mu.Unlock()
 }
 
-func (w *symbolWatcher) start(ctx context.Context) {
+func (w *intervalWatcher) start(ctx context.Context) {
 	childCtx, cancel := context.WithCancel(ctx)
 	w.cancel = cancel
 	go w.run(childCtx)
 }
 
-func (w *symbolWatcher) run(ctx context.Context) {
+func (w *intervalWatcher) run(ctx context.Context) {
 	defer close(w.done)
 	backoff := time.Second
 	for {
@@ -332,7 +261,7 @@ func (w *symbolWatcher) run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		log.Printf("监听 %s 连接断开: %v", w.symbol, err)
+		log.Printf("监听 %s %s 连接断开: %v", w.symbol, w.interval, err)
 		select {
 		case <-ctx.Done():
 			return
@@ -347,8 +276,8 @@ func (w *symbolWatcher) run(ctx context.Context) {
 	}
 }
 
-func (w *symbolWatcher) connect(ctx context.Context) error {
-	endpoint := fmt.Sprintf("%s/%s@kline_1m", wsBaseURL, strings.ToLower(w.symbol))
+func (w *intervalWatcher) connect(ctx context.Context) error {
+	endpoint := fmt.Sprintf("%s/%s@kline_%s", wsBaseURL, strings.ToLower(w.symbol), w.interval)
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, endpoint, nil)
 	if err != nil {
 		return err
@@ -379,7 +308,7 @@ func (w *symbolWatcher) connect(ctx context.Context) error {
 	}
 }
 
-func (w *symbolWatcher) upsert(c candle) {
+func (w *intervalWatcher) upsert(c candle) {
 	w.mu.Lock()
 	handler := w.onCandle
 	updated := false
@@ -389,18 +318,18 @@ func (w *symbolWatcher) upsert(c candle) {
 		updated = true
 	} else {
 		w.candles = append(w.candles, c)
-		if len(w.candles) > max1mCandles {
-			w.candles = w.candles[len(w.candles)-max1mCandles:]
+		if len(w.candles) > positionKlineLimit {
+			w.candles = w.candles[len(w.candles)-positionKlineLimit:]
 		}
 		updated = true
 	}
 	w.mu.Unlock()
 	if updated && handler != nil {
-		go handler(w.symbol)
+		go handler(w.symbol, w.interval)
 	}
 }
 
-func (w *symbolWatcher) snapshot() []candle {
+func (w *intervalWatcher) snapshot() []candle {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	copyCandles := make([]candle, len(w.candles))
@@ -408,11 +337,115 @@ func (w *symbolWatcher) snapshot() []candle {
 	return dedupeCandles(copyCandles)
 }
 
-func (w *symbolWatcher) Close() {
+func (w *intervalWatcher) Close() {
 	if w.cancel != nil {
 		w.cancel()
 	}
 	<-w.done
+}
+
+func (m *symbolManager) EnsureWatchers(ctx context.Context, symbols []string) {
+	for _, sym := range symbols {
+		sym = strings.ToUpper(sym)
+		if sym == "" {
+			continue
+		}
+		for _, iv := range intervalConfigs {
+			m.ensureIntervalWatcher(ctx, sym, iv.Name, iv.Duration)
+		}
+	}
+}
+
+func (m *symbolManager) ensureIntervalWatcher(ctx context.Context, symbol, interval string, duration time.Duration) {
+	m.mu.RLock()
+	intervalMap := m.watchers[interval]
+	existing := intervalMap[strings.ToUpper(symbol)]
+	onCandle := m.onCandle
+	m.mu.RUnlock()
+	if existing != nil {
+		existing.setHandler(onCandle)
+		return
+	}
+	ctxTimeout, cancel := context.WithTimeout(ctx, 30*time.Second)
+	candles, err := fetchHistoricalInterval(ctxTimeout, m.client, symbol, interval, initialKlineLimit)
+	cancel()
+	if err != nil {
+		log.Printf("初始化 %s %s 监听失败: %v", symbol, interval, err)
+		return
+	}
+	watcher := newIntervalWatcher(symbol, interval, duration, candles, onCandle)
+	m.mu.Lock()
+	intervalMap = m.watchers[interval]
+	if _, exists := intervalMap[strings.ToUpper(symbol)]; exists {
+		m.mu.Unlock()
+		return
+	}
+	intervalMap[strings.ToUpper(symbol)] = watcher
+	m.mu.Unlock()
+	watcher.start(ctx)
+	log.Printf("开始监听 %s %s，初始K线: %d 条", symbol, interval, len(candles))
+}
+
+func (m *symbolManager) getWatcher(symbol, interval string) *intervalWatcher {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if intervalMap, ok := m.watchers[interval]; ok {
+		return intervalMap[strings.ToUpper(symbol)]
+	}
+	return nil
+}
+
+func (m *symbolManager) SetCandleHandler(handler func(string, string)) {
+	m.mu.Lock()
+	m.onCandle = handler
+	for interval := range m.watchers {
+		for _, w := range m.watchers[interval] {
+			w.setHandler(handler)
+		}
+	}
+	m.mu.Unlock()
+}
+
+func (m *symbolManager) EvaluateStrategies(symbols []string) []strategyResult {
+	results := make([]strategyResult, 0, len(symbols))
+	for _, sym := range symbols {
+		w3 := m.getWatcher(sym, "3m")
+		w5 := m.getWatcher(sym, "5m")
+		if w3 == nil || w5 == nil {
+			continue
+		}
+		candles3 := w3.snapshot()
+		candles5 := w5.snapshot()
+		if len(candles3) == 0 || len(candles5) == 0 {
+			continue
+		}
+		rs, err := computeStrategyFromCandles(sym, candles3, candles5, m.cfg)
+		if err != nil {
+			log.Printf("策略计算失败 %s: %v", sym, err)
+			continue
+		}
+		results = append(results, rs)
+	}
+	return results
+}
+
+func (m *symbolManager) Close() {
+	m.mu.Lock()
+	watchers := make([]*intervalWatcher, 0)
+	for _, intervalMap := range m.watchers {
+		for _, w := range intervalMap {
+			watchers = append(watchers, w)
+		}
+	}
+	for _, intervalMap := range m.watchers {
+		for k := range intervalMap {
+			delete(intervalMap, k)
+		}
+	}
+	m.mu.Unlock()
+	for _, w := range watchers {
+		w.Close()
+	}
 }
 
 type binanceClient struct {
@@ -840,15 +873,59 @@ type tradeManager struct {
 	qty        map[string]float64
 	httpClient *http.Client
 	watchMgr   *symbolManager
+	cooldownMu sync.RWMutex
+	cooldown   map[string]int
 }
 
 func newTradeManager(client *binanceClient, positions []positionEntry, cfg config, httpClient *http.Client, watchMgr *symbolManager) *tradeManager {
 	pm := newPositionManager(cfg.maxPositions)
 	pm.Replace(positions)
-	return &tradeManager{client: client, positions: pm, cfg: cfg, qty: make(map[string]float64), httpClient: httpClient, watchMgr: watchMgr}
+	return &tradeManager{
+		client:     client,
+		positions:  pm,
+		cfg:        cfg,
+		qty:        make(map[string]float64),
+		httpClient: httpClient,
+		watchMgr:   watchMgr,
+		cooldown:   make(map[string]int),
+	}
 }
 
-func (tm *tradeManager) OnCandleUpdate(symbol string) {
+func (tm *tradeManager) startCooldown(symbol string) {
+	tm.cooldownMu.Lock()
+	tm.cooldown[strings.ToUpper(symbol)] = 5
+	tm.cooldownMu.Unlock()
+}
+
+func (tm *tradeManager) cooldownTick(symbol string) {
+	tm.cooldownMu.Lock()
+	defer tm.cooldownMu.Unlock()
+	symbol = strings.ToUpper(symbol)
+	if symbol == "" {
+		return
+	}
+	if tm.cooldown == nil {
+		tm.cooldown = make(map[string]int)
+	}
+	if v, ok := tm.cooldown[symbol]; ok {
+		if v <= 1 {
+			delete(tm.cooldown, symbol)
+		} else {
+			tm.cooldown[symbol] = v - 1
+		}
+	}
+}
+
+func (tm *tradeManager) isCoolingDown(symbol string) bool {
+	tm.cooldownMu.RLock()
+	defer tm.cooldownMu.RUnlock()
+	if tm.cooldown == nil {
+		return false
+	}
+	return tm.cooldown[strings.ToUpper(symbol)] > 0
+}
+
+func (tm *tradeManager) OnCandleUpdate(symbol, interval string) {
 	if tm == nil || !tm.cfg.autoTrade {
 		return
 	}
@@ -868,6 +945,7 @@ func (tm *tradeManager) handleCandleUpdate(symbol string) {
 	if err := tm.evaluateOpenForSymbol(ctx, symbol); err != nil {
 		log.Printf("基于3m更新评估开仓失败 %s: %v", symbol, err)
 	}
+	tm.cooldownTick(symbol)
 }
 
 func (tm *tradeManager) checkPositionForSymbol(ctx context.Context, symbol string) error {
@@ -911,6 +989,9 @@ func (tm *tradeManager) checkPositionForSymbol(ctx context.Context, symbol strin
 			}
 		}
 	}
+	if firstErr == nil {
+		tm.startCooldown(symbol)
+	}
 	return firstErr
 }
 
@@ -919,6 +1000,9 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 		return nil
 	}
 	if tm.positions.Remaining() <= 0 {
+		return nil
+	}
+	if tm.isCoolingDown(symbol) {
 		return nil
 	}
 	sr, err := computeStrategyForSymbol(ctx, tm.watchMgr, symbol, tm.cfg)
@@ -977,19 +1061,22 @@ func computeStrategyForSymbol(ctx context.Context, watchMgr *symbolManager, symb
 	if watchMgr == nil {
 		return strategyResult{}, errors.New("行情管理器未初始化")
 	}
-	w := watchMgr.getWatcher(symbol)
-	if w == nil {
+	w3 := watchMgr.getWatcher(symbol, "3m")
+	w5 := watchMgr.getWatcher(symbol, "5m")
+	if w3 == nil || w5 == nil {
 		watchMgr.EnsureWatchers(ctx, []string{symbol})
-		w = watchMgr.getWatcher(symbol)
-		if w == nil {
+		w3 = watchMgr.getWatcher(symbol, "3m")
+		w5 = watchMgr.getWatcher(symbol, "5m")
+		if w3 == nil || w5 == nil {
 			return strategyResult{}, fmt.Errorf("未找到 %s 的行情缓存", symbol)
 		}
 	}
-	candles := w.snapshot()
-	if len(candles) == 0 {
+	candles3 := w3.snapshot()
+	candles5 := w5.snapshot()
+	if len(candles3) == 0 || len(candles5) == 0 {
 		return strategyResult{}, errors.New("行情数据不足")
 	}
-	return computeStrategyFromCandles(symbol, candles, cfg)
+	return computeStrategyFromCandles(symbol, candles3, candles5, cfg)
 }
 
 func (tm *tradeManager) refreshPositions(ctx context.Context) error {
@@ -1314,10 +1401,14 @@ func (tm *tradeManager) closePosition(ctx context.Context, symbol, side string) 
 	return nil
 }
 
-func fetchHistorical1m(ctx context.Context, c *http.Client, symbol string, limit int) ([]candle, error) {
-	url := fmt.Sprintf("%s%s?symbol=%s&interval=1m&limit=%d", baseURL, klinesEP, symbol, limit)
+func fetchHistoricalInterval(ctx context.Context, c *http.Client, symbol, interval string, limit int) ([]candle, error) {
+	url := fmt.Sprintf("%s%s?symbol=%s&interval=%s&limit=%d", baseURL, klinesEP, symbol, interval, limit)
 	var raw [][]interface{}
 	if err := getJSON(ctx, c, url, &raw); err != nil {
+		return nil, err
+	}
+	dur, err := time.ParseDuration(interval)
+	if err != nil {
 		return nil, err
 	}
 	candles := make([]candle, 0, len(raw))
@@ -1340,7 +1431,7 @@ func fetchHistorical1m(ctx context.Context, c *http.Client, symbol string, limit
 		openTime := time.UnixMilli(int64(opTimeFloat))
 		candles = append(candles, candle{
 			OpenTime:  openTime,
-			CloseTime: openTime.Add(time.Minute),
+			CloseTime: openTime.Add(dur),
 			Open:      op,
 			High:      high,
 			Low:       low,
@@ -2296,30 +2387,29 @@ func scoreTimeframe(tf timeframeAnalysis, adxThreshold float64, long bool) float
 	return score
 }
 
-func computeStrategyFromCandles(symbol string, candles []candle, cfg config) (strategyResult, error) {
+func computeStrategyFromCandles(symbol string, candles3m, candles5m []candle, cfg config) (strategyResult, error) {
 	result := strategyResult{Symbol: symbol}
-	clean := dedupeCandles(candles)
-	if len(clean) < 121 {
-		return result, errors.New("1m K线不足 121 条")
+	clean3 := dedupeCandles(candles3m)
+	clean5 := dedupeCandles(candles5m)
+	if len(clean3) < 121 {
+		return result, errors.New("3m K线不足 121 条")
+	}
+	if len(clean5) < 121 {
+		return result, errors.New("5m K线不足 121 条")
 	}
 
-	metrics, err := computeMetricsFromCandles(symbol, clean)
+	metrics, err := computeMetricsFromCandles(symbol, clean3)
 	if err != nil {
 		return result, err
 	}
 	result.Metrics = metrics
 
-	threeMinuteCandles := aggregateToInterval(clean, 3*time.Minute)
-	if len(threeMinuteCandles) == 0 {
-		return result, errors.New("3m K线数据不足")
-	}
-	threeMinute, err := computeTimeframeAnalysis("3m", threeMinuteCandles, cfg)
+	threeMinute, err := computeTimeframeAnalysis("3m", clean3, cfg)
 	if err != nil {
 		return result, err
 	}
 
-	fiveMinuteCandles := aggregateTo5m(clean)
-	fiveMinute, err := computeTimeframeAnalysis("5m", fiveMinuteCandles, cfg)
+	fiveMinute, err := computeTimeframeAnalysis("5m", clean5, cfg)
 	if err != nil {
 		return result, err
 	}
@@ -2344,7 +2434,7 @@ func computeStrategyFromCandles(symbol string, candles []candle, cfg config) (st
 
 func fetchSymbolMetrics(ctx context.Context, c *http.Client, symbol string) (symbolMetrics, error) {
 	metrics := symbolMetrics{Symbol: symbol}
-	candles, err := fetchHistorical1m(ctx, c, symbol, positionKlineLimit)
+	candles, err := fetchHistoricalInterval(ctx, c, symbol, "3m", positionKlineLimit)
 	if err != nil {
 		return metrics, err
 	}
