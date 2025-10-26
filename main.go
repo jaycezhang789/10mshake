@@ -99,11 +99,12 @@ type strategyResult struct {
 }
 
 type symbolWatcher struct {
-	symbol  string
-	mu      sync.RWMutex
-	candles []candle
-	cancel  context.CancelFunc
-	done    chan struct{}
+	symbol   string
+	mu       sync.RWMutex
+	candles  []candle
+	cancel   context.CancelFunc
+	done     chan struct{}
+	onCandle func(string)
 }
 
 type symbolManager struct {
@@ -111,6 +112,7 @@ type symbolManager struct {
 	watchers map[string]*symbolWatcher
 	client   *http.Client
 	cfg      config
+	onCandle func(string)
 }
 
 type symbolFilter struct {
@@ -179,6 +181,7 @@ func newSymbolManager(client *http.Client, cfg config) *symbolManager {
 		watchers: make(map[string]*symbolWatcher),
 		client:   client,
 		cfg:      cfg,
+		onCandle: nil,
 	}
 }
 
@@ -189,9 +192,10 @@ func (m *symbolManager) EnsureWatchers(ctx context.Context, symbols []string) {
 			continue
 		}
 		m.mu.RLock()
-		_, exists := m.watchers[sym]
+		wExisting, exists := m.watchers[sym]
 		m.mu.RUnlock()
 		if exists {
+			wExisting.setHandler(m.onCandle)
 			continue
 		}
 
@@ -203,7 +207,7 @@ func (m *symbolManager) EnsureWatchers(ctx context.Context, symbols []string) {
 			continue
 		}
 
-		watcher := newSymbolWatcher(sym, candles)
+		watcher := newSymbolWatcher(sym, candles, m.onCandle)
 
 		m.mu.Lock()
 		if _, exists := m.watchers[sym]; exists {
@@ -222,6 +226,15 @@ func (m *symbolManager) getWatcher(symbol string) *symbolWatcher {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.watchers[strings.ToUpper(symbol)]
+}
+
+func (m *symbolManager) SetCandleHandler(handler func(string)) {
+	m.mu.Lock()
+	m.onCandle = handler
+	for _, w := range m.watchers {
+		w.setHandler(handler)
+	}
+	m.mu.Unlock()
 }
 
 func (m *symbolManager) EvaluateStrategies(symbols []string) []strategyResult {
@@ -280,15 +293,22 @@ func dedupeCandles(candles []candle) []candle {
 	return result
 }
 
-func newSymbolWatcher(symbol string, candles []candle) *symbolWatcher {
+func newSymbolWatcher(symbol string, candles []candle, handler func(string)) *symbolWatcher {
 	clean := dedupeCandles(candles)
 	copyCandles := make([]candle, len(clean))
 	copy(copyCandles, clean)
 	return &symbolWatcher{
-		symbol:  symbol,
-		candles: copyCandles,
-		done:    make(chan struct{}),
+		symbol:   symbol,
+		candles:  copyCandles,
+		done:     make(chan struct{}),
+		onCandle: handler,
 	}
+}
+
+func (w *symbolWatcher) setHandler(handler func(string)) {
+	w.mu.Lock()
+	w.onCandle = handler
+	w.mu.Unlock()
 }
 
 func (w *symbolWatcher) start(ctx context.Context) {
@@ -360,15 +380,22 @@ func (w *symbolWatcher) connect(ctx context.Context) error {
 
 func (w *symbolWatcher) upsert(c candle) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	handler := w.onCandle
+	updated := false
 	n := len(w.candles)
 	if n > 0 && w.candles[n-1].OpenTime.Equal(c.OpenTime) {
 		w.candles[n-1] = c
-		return
+		updated = true
+	} else {
+		w.candles = append(w.candles, c)
+		if len(w.candles) > max1mCandles {
+			w.candles = w.candles[len(w.candles)-max1mCandles:]
+		}
+		updated = true
 	}
-	w.candles = append(w.candles, c)
-	if len(w.candles) > max1mCandles {
-		w.candles = w.candles[len(w.candles)-max1mCandles:]
+	w.mu.Unlock()
+	if updated && handler != nil {
+		go handler(w.symbol)
 	}
 }
 
@@ -818,6 +845,72 @@ func newTradeManager(client *binanceClient, positions []positionEntry, cfg confi
 	pm := newPositionManager(cfg.maxPositions)
 	pm.Replace(positions)
 	return &tradeManager{client: client, positions: pm, cfg: cfg, qty: make(map[string]float64), httpClient: httpClient, watchMgr: watchMgr}
+}
+
+func (tm *tradeManager) OnCandleUpdate(symbol string) {
+	if tm == nil || !tm.cfg.autoTrade {
+		return
+	}
+	symbol = strings.ToUpper(symbol)
+	if symbol == "" {
+		return
+	}
+	if !tm.positions.Has(symbol, "LONG") && !tm.positions.Has(symbol, "SHORT") {
+		return
+	}
+	go tm.handleCandleUpdate(symbol)
+}
+
+func (tm *tradeManager) handleCandleUpdate(symbol string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := tm.checkPositionForSymbol(ctx, symbol); err != nil {
+		log.Printf("基于1m更新检查持仓失败 %s: %v", symbol, err)
+	}
+}
+
+func (tm *tradeManager) checkPositionForSymbol(ctx context.Context, symbol string) error {
+	symbol = strings.ToUpper(symbol)
+	if symbol == "" || tm.watchMgr == nil {
+		return nil
+	}
+	hasLong := tm.positions.Has(symbol, "LONG")
+	hasShort := tm.positions.Has(symbol, "SHORT")
+	if !hasLong && !hasShort {
+		return nil
+	}
+	if err := tm.refreshPositions(ctx); err != nil {
+		return err
+	}
+	hasLong = tm.positions.Has(symbol, "LONG")
+	hasShort = tm.positions.Has(symbol, "SHORT")
+	if !hasLong && !hasShort {
+		return nil
+	}
+	sr, err := computeStrategyForSymbol(ctx, tm.watchMgr, symbol, tm.cfg)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	if hasLong && shouldClosePosition("LONG", sr) {
+		if err := tm.closePosition(ctx, symbol, "LONG"); err != nil {
+			log.Printf("1m 平多失败 %s: %v", symbol, err)
+			tm.notifyError(ctx, fmt.Sprintf("平多失败 %s: %v", symbol, err))
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	if hasShort && shouldClosePosition("SHORT", sr) {
+		if err := tm.closePosition(ctx, symbol, "SHORT"); err != nil {
+			log.Printf("1m 平空失败 %s: %v", symbol, err)
+			tm.notifyError(ctx, fmt.Sprintf("平空失败 %s: %v", symbol, err))
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 func shouldClosePosition(side string, sr strategyResult) bool {
@@ -1438,11 +1531,6 @@ func initializeExistingPositions(ctx context.Context, tradeMgr *tradeManager) {
 	}
 }
 
-func durationUntilNext5m(now time.Time) time.Duration {
-	next := now.Truncate(5 * time.Minute).Add(5 * time.Minute)
-	return next.Sub(now)
-}
-
 func run(cfg config) error {
 	if cfg.telegramToken == "" || cfg.telegramChatID == "" {
 		return errors.New("未配置 Telegram 凭证：请在环境变量 TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID 中设置")
@@ -1472,6 +1560,7 @@ func run(cfg config) error {
 		}
 		tradeMgr = newTradeManager(binance, positions, cfg, httpClient, watchMgr)
 		log.Printf("当前持仓数量: %d / %d", tradeMgr.positions.Count(), cfg.maxPositions)
+		watchMgr.SetCandleHandler(tradeMgr.OnCandleUpdate)
 		initializeExistingPositions(ctx, tradeMgr)
 	}
 
@@ -1641,19 +1730,6 @@ func run(cfg config) error {
 	defer updateTicker.Stop()
 	positionTicker := time.NewTicker(6 * time.Minute)
 	defer positionTicker.Stop()
-	var (
-		positionExitTimer *time.Timer
-		positionExitC     <-chan time.Time
-	)
-	if cfg.autoTrade && tradeMgr != nil {
-		wait := durationUntilNext5m(time.Now())
-		if wait <= 0 {
-			wait = 5 * time.Minute
-		}
-		positionExitTimer = time.NewTimer(wait)
-		positionExitC = positionExitTimer.C
-		defer positionExitTimer.Stop()
-	}
 
 	log.Printf("启动完成：成交量刷新周期 %s，涨跌幅推送周期 %s", cfg.volumeRefresh, cfg.updateInterval)
 
@@ -1662,17 +1738,6 @@ func run(cfg config) error {
 		case <-ctx.Done():
 			log.Println("收到终止信号，程序退出")
 			return nil
-		case <-positionExitC:
-			if cfg.autoTrade && tradeMgr != nil {
-				ctxExit, cancel := context.WithTimeout(ctx, 90*time.Second)
-				if err := tradeMgr.CheckPositionExits(ctxExit); err != nil {
-					log.Printf("5m 持仓检查失败: %v", err)
-				}
-				cancel()
-			}
-			if positionExitTimer != nil {
-				positionExitTimer.Reset(durationUntilNext5m(time.Now()))
-			}
 		case <-volumeTicker.C:
 			if err := refreshVolumeList(ctx); err != nil {
 				log.Printf("刷新成交量列表失败: %v", err)
@@ -1840,30 +1905,36 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 	b.WriteString("信号列表 (仅展示满足开仓条件的标的)：\n")
 	printed := false
 	for _, sr := range strategies {
-		if !sr.LongSignal && !sr.ShortSignal {
-			continue
+		if sr.LongSignal {
+			printed = true
+			b.WriteString(fmt.Sprintf("[开多] %-10s 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s\n",
+				sr.Symbol,
+				sr.Metrics.Change30m,
+				sr.Metrics.Change10m,
+				sr.Metrics.AvgAmplitude,
+				summarizeTimeframe(sr.FiveMinute),
+				summarizeTimeframe(sr.OneMinute),
+				formatQtyInfo(qtyMap, sr.Symbol),
+			))
 		}
-		printed = true
-		direction := "开多"
 		if sr.ShortSignal {
-			direction = "开空"
+			printed = true
+			b.WriteString(fmt.Sprintf("[开空] %-10s 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s\n",
+				sr.Symbol,
+				sr.Metrics.Change30m,
+				sr.Metrics.Change10m,
+				sr.Metrics.AvgAmplitude,
+				summarizeTimeframe(sr.FiveMinute),
+				summarizeTimeframe(sr.OneMinute),
+				formatQtyInfo(qtyMap, sr.Symbol),
+			))
 		}
-		b.WriteString(fmt.Sprintf("[%s] %-10s 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s\n",
-			direction,
-			sr.Symbol,
-			sr.Metrics.Change30m,
-			sr.Metrics.Change10m,
-			sr.Metrics.AvgAmplitude,
-			summarizeTimeframe(sr.FiveMinute),
-			summarizeTimeframe(sr.OneMinute),
-			formatQtyInfo(qtyMap, sr.Symbol),
-		))
 	}
 	if !printed {
 		b.WriteString("暂无可开仓信号\n")
 	}
 
-	b.WriteString("\n涨幅榜 (Top %d)：\n")
+	b.WriteString(fmt.Sprintf("\n涨幅榜 (Top %d)：\n", top))
 	for i, g := range gainers {
 		if i >= top {
 			break
@@ -1871,7 +1942,7 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 		b.WriteString(fmt.Sprintf("%2d) %-12s 30m:%+0.4f%% 10m:%+0.4f%% 收盘价: %.8f\n", i+1, g.Symbol, g.Change30m, g.Change10m, g.Last))
 	}
 
-	b.WriteString("\n跌幅榜 (Top %d)：\n")
+	b.WriteString(fmt.Sprintf("\n跌幅榜 (Top %d)：\n", top))
 	for i, l := range losers {
 		if i >= top {
 			break
