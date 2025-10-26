@@ -2258,15 +2258,23 @@ func (tm *tradeManager) getCooloffExpiry() time.Time {
 }
 
 func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string, snapshot *strategyResult) error {
+	logDecision := func(decision string, reasons []string) {
+		if len(reasons) > 0 {
+			log.Printf("%s 决策：%s（%s）", symbol, decision, strings.Join(reasons, "; "))
+		} else {
+			log.Printf("%s 决策：%s", symbol, decision)
+		}
+	}
+
 	if tm == nil || tm.watchMgr == nil {
 		return nil
 	}
 	if tm.positions.Remaining() <= 0 {
-		log.Printf("%s 未开仓：已达到最大持仓数量", symbol)
+		logDecision("跳过", []string{"已达到最大持仓数量"})
 		return nil
 	}
 	if tm.isCoolingDown(symbol) {
-		log.Printf("%s 未开仓：冷却中", symbol)
+		logDecision("跳过", []string{"冷却中"})
 		return nil
 	}
 	var sr strategyResult
@@ -2285,79 +2293,108 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 	tm.updateReentryReset(symbol, "LONG", sr)
 	tm.updateReentryReset(symbol, "SHORT", sr)
 	if sr.Score <= 0 {
-		log.Printf("%s 未开仓：策略得分 %.4f <= 0", symbol, sr.Score)
+		logDecision("跳过", []string{fmt.Sprintf("策略得分 %.4f <= 0", sr.Score)})
 		return nil
 	}
 	price := sr.Metrics.Last
 	if price <= 0 {
-		log.Printf("%s 未开仓：最新价格无效 %.6f", symbol, price)
+		logDecision("跳过", []string{fmt.Sprintf("最新价格无效 %.6f", price)})
 		return nil
 	}
 	key := sr.Last3mBarID + "::" + sr.Last5mBarID
 	if key != "::" && !tm.shouldEvaluateSymbolKey(symbol, key) {
-		log.Printf("%s 未开仓：已评估过最近 K 线快照 %s", symbol, key)
+		logDecision("跳过", []string{"已评估过最近 K 线快照"})
 		return nil
 	}
 	if !tm.evaluateEntryEnvironment(ctx, &sr) {
+		reasons := []string{"环境过滤未通过"}
 		if len(sr.BlockReasons) > 0 {
-			log.Printf("%s 环境不满足开仓: %s", symbol, strings.Join(sr.BlockReasons, "; "))
-		} else {
-			log.Printf("%s 未开仓：环境过滤未通过（无具体原因）", symbol)
+			reasons = append(reasons, sr.BlockReasons...)
 		}
+		logDecision("跳过", reasons)
 		return nil
 	}
+
 	var firstErr error
-	if sr.LongSignal && !tm.positions.Has(symbol, "LONG") {
-		if !tm.canEnterAfterReset(symbol, "LONG", sr) {
-			if tm.isRecentlyClosed(symbol, "LONG") {
-				sr.BlockReasons = append(sr.BlockReasons, "最近平仓冷却中")
-				log.Printf("%s 未开多：%s", symbol, strings.Join(sr.BlockReasons, "; "))
-			}
-			goto shortCheck
-		}
-		if err := tm.openPosition(ctx, symbol, "LONG", price); err != nil {
-			log.Printf("实时开多失败 %s: %v", symbol, err)
-			tm.notifyError(ctx, fmt.Sprintf("开多失败 %s: %v", symbol, err))
-			if firstErr == nil {
-				firstErr = err
-			}
-		} else {
-			tm.clearReentryState(symbol, "LONG")
-		}
-	}
-shortCheck:
-	if tm.positions.Remaining() <= 0 {
-		return firstErr
-	}
-	if sr.ShortSignal && !tm.positions.Has(symbol, "SHORT") {
-		if !tm.canEnterAfterReset(symbol, "SHORT", sr) {
-			if tm.isRecentlyClosed(symbol, "SHORT") {
-				sr.BlockReasons = append(sr.BlockReasons, "最近平仓冷却中")
-				log.Printf("%s 未开空：%s", symbol, strings.Join(sr.BlockReasons, "; "))
-			}
-			return firstErr
-		}
-		if err := tm.openPosition(ctx, symbol, "SHORT", price); err != nil {
-			log.Printf("实时开空失败 %s: %v", symbol, err)
-			tm.notifyError(ctx, fmt.Sprintf("开空失败 %s: %v", symbol, err))
-			if firstErr == nil {
-				firstErr = err
-			}
-		} else {
-			tm.clearReentryState(symbol, "SHORT")
-		}
-	}
-	tm.storeSnapshot(sr)
-	if !sr.LongSignal && !sr.ShortSignal {
-		log.Printf("%s 未开仓：多空信号均未触发", symbol)
+	openedLong := false
+	openedShort := false
+	longReasons := []string{}
+	shortReasons := []string{}
+	if sr.LongSignal {
+		longReasons = append(longReasons, "多头信号触发")
 	} else {
-		if sr.LongSignal && tm.positions.Has(symbol, "LONG") {
-			log.Printf("%s 未开多：已有多头持仓", symbol)
-		}
-		if sr.ShortSignal && tm.positions.Has(symbol, "SHORT") {
-			log.Printf("%s 未开空：已有空头持仓", symbol)
+		longReasons = append(longReasons, "多头信号未触发")
+	}
+	if sr.ShortSignal {
+		shortReasons = append(shortReasons, "空头信号触发")
+	} else {
+		shortReasons = append(shortReasons, "空头信号未触发")
+	}
+
+	if sr.LongSignal {
+		if tm.positions.Has(symbol, "LONG") {
+			longReasons = append(longReasons, "已有多头持仓")
+		} else if !tm.canEnterAfterReset(symbol, "LONG", sr) {
+			if tm.isRecentlyClosed(symbol, "LONG") {
+				longReasons = append(longReasons, "重入门槛未达成（最近平仓冷却中）")
+			} else {
+				longReasons = append(longReasons, "重入门槛未达成")
+			}
+		} else {
+			if err := tm.openPosition(ctx, symbol, "LONG", price); err != nil {
+				longReasons = append(longReasons, fmt.Sprintf("开多失败: %v", err))
+				tm.notifyError(ctx, fmt.Sprintf("开多失败 %s: %v", symbol, err))
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				tm.clearReentryState(symbol, "LONG")
+				longReasons = append(longReasons, "开多成功")
+				openedLong = true
+			}
 		}
 	}
+
+	if sr.ShortSignal {
+		if tm.positions.Has(symbol, "SHORT") {
+			shortReasons = append(shortReasons, "已有空头持仓")
+		} else if tm.positions.Remaining() <= 0 {
+			shortReasons = append(shortReasons, "持仓额度不足")
+		} else if !tm.canEnterAfterReset(symbol, "SHORT", sr) {
+			if tm.isRecentlyClosed(symbol, "SHORT") {
+				shortReasons = append(shortReasons, "重入门槛未达成（最近平仓冷却中）")
+			} else {
+				shortReasons = append(shortReasons, "重入门槛未达成")
+			}
+		} else {
+			if err := tm.openPosition(ctx, symbol, "SHORT", price); err != nil {
+				shortReasons = append(shortReasons, fmt.Sprintf("开空失败: %v", err))
+				tm.notifyError(ctx, fmt.Sprintf("开空失败 %s: %v", symbol, err))
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				tm.clearReentryState(symbol, "SHORT")
+				shortReasons = append(shortReasons, "开空成功")
+				openedShort = true
+			}
+		}
+	}
+
+	tm.storeSnapshot(sr)
+
+	summary := []string{}
+	if openedLong {
+		summary = append(summary, "多头："+strings.Join(longReasons, "; "))
+	} else {
+		summary = append(summary, "多头："+strings.Join(longReasons, "; "))
+	}
+	if openedShort {
+		summary = append(summary, "空头："+strings.Join(shortReasons, "; "))
+	} else {
+		summary = append(summary, "空头："+strings.Join(shortReasons, "; "))
+	}
+	logDecision("评估完成", summary)
 	return firstErr
 }
 
