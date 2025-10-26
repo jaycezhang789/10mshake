@@ -83,7 +83,11 @@ type timeframeAnalysis struct {
 	EMASlowSlope float64
 	MACDHist     float64
 	MACDPrev     float64
+	MACDPrevPrev float64
 	ADX          float64
+	ADXPrev      float64
+	ADXPrev2     float64
+	ADXPrev3     float64
 	LongSignal   bool
 	ShortSignal  bool
 }
@@ -875,6 +879,8 @@ type tradeManager struct {
 	watchMgr   *symbolManager
 	cooldownMu sync.RWMutex
 	cooldown   map[string]int
+	tightenMu  sync.RWMutex
+	tightened  map[string]bool
 }
 
 func newTradeManager(client *binanceClient, positions []positionEntry, cfg config, httpClient *http.Client, watchMgr *symbolManager) *tradeManager {
@@ -888,16 +894,87 @@ func newTradeManager(client *binanceClient, positions []positionEntry, cfg confi
 		httpClient: httpClient,
 		watchMgr:   watchMgr,
 		cooldown:   make(map[string]int),
+		tightened:  make(map[string]bool),
+	}
+}
+
+func (tm *tradeManager) tightenKey(symbol, side string) string {
+	return strings.ToUpper(symbol) + "::" + strings.ToUpper(side)
+}
+
+func (tm *tradeManager) setTightening(symbol, side string) {
+	tm.tightenMu.Lock()
+	if tm.tightened == nil {
+		tm.tightened = make(map[string]bool)
+	}
+	tm.tightened[tm.tightenKey(symbol, side)] = true
+	tm.tightenMu.Unlock()
+}
+
+func (tm *tradeManager) clearTightening(symbol, side string) {
+	tm.tightenMu.Lock()
+	if tm.tightened != nil {
+		delete(tm.tightened, tm.tightenKey(symbol, side))
+	}
+	tm.tightenMu.Unlock()
+}
+
+func (tm *tradeManager) isTightening(symbol, side string) bool {
+	tm.tightenMu.RLock()
+	defer tm.tightenMu.RUnlock()
+	if tm.tightened == nil {
+		return false
+	}
+	return tm.tightened[tm.tightenKey(symbol, side)]
+}
+
+func shouldTightenPosition(side string, sr strategyResult) bool {
+	switch strings.ToUpper(side) {
+	case "LONG":
+		weakening := sr.ThreeMinute.MACDHist > 0 &&
+			sr.ThreeMinute.MACDPrev > 0 &&
+			sr.ThreeMinute.MACDPrevPrev > 0 &&
+			sr.ThreeMinute.MACDHist < sr.ThreeMinute.MACDPrev &&
+			sr.ThreeMinute.MACDPrev < sr.ThreeMinute.MACDPrevPrev
+		adxFlat := sr.FiveMinute.ADX <= sr.FiveMinute.ADXPrev
+		return weakening && adxFlat
+	case "SHORT":
+		weakening := sr.ThreeMinute.MACDHist < 0 &&
+			sr.ThreeMinute.MACDPrev < 0 &&
+			sr.ThreeMinute.MACDPrevPrev < 0 &&
+			sr.ThreeMinute.MACDHist > sr.ThreeMinute.MACDPrev &&
+			sr.ThreeMinute.MACDPrev > sr.ThreeMinute.MACDPrevPrev
+		adxFlat := sr.FiveMinute.ADX <= sr.FiveMinute.ADXPrev
+		return weakening && adxFlat
+	default:
+		return false
+	}
+}
+
+func shouldClosePosition(side string, sr strategyResult) bool {
+	switch strings.ToUpper(side) {
+	case "LONG":
+		return sr.ThreeMinute.MACDHist <= 0 && sr.FiveMinute.EMAFastSlope <= 0
+	case "SHORT":
+		return sr.ThreeMinute.MACDHist >= 0 && sr.FiveMinute.EMAFastSlope >= 0
+	default:
+		return false
 	}
 }
 
 func (tm *tradeManager) startCooldown(symbol string) {
 	tm.cooldownMu.Lock()
+	if tm.cooldown == nil {
+		tm.cooldown = make(map[string]int)
+	}
 	tm.cooldown[strings.ToUpper(symbol)] = 5
 	tm.cooldownMu.Unlock()
 }
 
-func (tm *tradeManager) cooldownTick(symbol string) {
+func (tm *tradeManager) cooldownTick(symbol, interval string) {
+	if strings.ToLower(interval) != "3m" {
+		return
+	}
 	tm.cooldownMu.Lock()
 	defer tm.cooldownMu.Unlock()
 	symbol = strings.ToUpper(symbol)
@@ -933,10 +1010,10 @@ func (tm *tradeManager) OnCandleUpdate(symbol, interval string) {
 	if symbol == "" {
 		return
 	}
-	go tm.handleCandleUpdate(symbol)
+	go tm.handleCandleUpdate(symbol, strings.ToLower(interval))
 }
 
-func (tm *tradeManager) handleCandleUpdate(symbol string) {
+func (tm *tradeManager) handleCandleUpdate(symbol, interval string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := tm.checkPositionForSymbol(ctx, symbol); err != nil {
@@ -945,7 +1022,7 @@ func (tm *tradeManager) handleCandleUpdate(symbol string) {
 	if err := tm.evaluateOpenForSymbol(ctx, symbol); err != nil {
 		log.Printf("基于3m更新评估开仓失败 %s: %v", symbol, err)
 	}
-	tm.cooldownTick(symbol)
+	tm.cooldownTick(symbol, interval)
 }
 
 func (tm *tradeManager) checkPositionForSymbol(ctx context.Context, symbol string) error {
@@ -971,26 +1048,47 @@ func (tm *tradeManager) checkPositionForSymbol(ctx context.Context, symbol strin
 		return err
 	}
 	var firstErr error
-	if hasLong && shouldClosePosition("LONG", sr) {
-		if err := tm.closePosition(ctx, symbol, "LONG"); err != nil {
-			log.Printf("3m 平多失败 %s: %v", symbol, err)
-			tm.notifyError(ctx, fmt.Sprintf("平多失败 %s: %v", symbol, err))
-			if firstErr == nil {
-				firstErr = err
+	if hasLong {
+		if shouldClosePosition("LONG", sr) {
+			if err := tm.closePosition(ctx, symbol, "LONG"); err != nil {
+				log.Printf("3m 平多失败 %s: %v", symbol, err)
+				tm.notifyError(ctx, fmt.Sprintf("平多失败 %s: %v", symbol, err))
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				tm.clearTightening(symbol, "LONG")
 			}
+		} else if shouldTightenPosition("LONG", sr) {
+			if !tm.isTightening(symbol, "LONG") {
+				log.Printf("%s LONG 触发动量预警，收紧止盈", symbol)
+			}
+			tm.setTightening(symbol, "LONG")
+		} else if tm.isTightening(symbol, "LONG") {
+			tm.clearTightening(symbol, "LONG")
+			log.Printf("%s LONG 动量恢复，解除收紧", symbol)
 		}
 	}
-	if hasShort && shouldClosePosition("SHORT", sr) {
-		if err := tm.closePosition(ctx, symbol, "SHORT"); err != nil {
-			log.Printf("3m 平空失败 %s: %v", symbol, err)
-			tm.notifyError(ctx, fmt.Sprintf("平空失败 %s: %v", symbol, err))
-			if firstErr == nil {
-				firstErr = err
+	if hasShort {
+		if shouldClosePosition("SHORT", sr) {
+			if err := tm.closePosition(ctx, symbol, "SHORT"); err != nil {
+				log.Printf("3m 平空失败 %s: %v", symbol, err)
+				tm.notifyError(ctx, fmt.Sprintf("平空失败 %s: %v", symbol, err))
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				tm.clearTightening(symbol, "SHORT")
 			}
+		} else if shouldTightenPosition("SHORT", sr) {
+			if !tm.isTightening(symbol, "SHORT") {
+				log.Printf("%s SHORT 触发动量预警，收紧止盈", symbol)
+			}
+			tm.setTightening(symbol, "SHORT")
+		} else if tm.isTightening(symbol, "SHORT") {
+			tm.clearTightening(symbol, "SHORT")
+			log.Printf("%s SHORT 动量恢复，解除收紧", symbol)
 		}
-	}
-	if firstErr == nil {
-		tm.startCooldown(symbol)
 	}
 	return firstErr
 }
@@ -1039,18 +1137,6 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 		}
 	}
 	return firstErr
-}
-
-func shouldClosePosition(side string, sr strategyResult) bool {
-	tf := sr.ThreeMinute
-	switch strings.ToUpper(side) {
-	case "LONG":
-		return tf.EMAFast <= tf.EMASlow || tf.MACDHist <= 0
-	case "SHORT":
-		return tf.EMAFast >= tf.EMASlow || tf.MACDHist >= 0
-	default:
-		return false
-	}
 }
 
 func computeStrategyForSymbol(ctx context.Context, watchMgr *symbolManager, symbol string, cfg config) (strategyResult, error) {
@@ -1147,16 +1233,29 @@ func (tm *tradeManager) CheckPositionExits(ctx context.Context) error {
 		if !ok {
 			continue
 		}
-		if !shouldClosePosition(side, sr) {
+		close := shouldClosePosition(side, sr)
+		tighten := shouldTightenPosition(side, sr)
+		if close {
+			err := tm.closePosition(ctx, symbol, side)
+			if err != nil {
+				log.Printf("5m 检查平仓失败 %s %s: %v", symbol, side, err)
+				tm.notifyError(ctx, fmt.Sprintf("平仓失败 %s %s: %v", symbol, side, err))
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				tm.clearTightening(symbol, side)
+			}
 			continue
 		}
-		err := tm.closePosition(ctx, symbol, side)
-		if err != nil {
-			log.Printf("5m 检查平仓失败 %s %s: %v", symbol, side, err)
-			tm.notifyError(ctx, fmt.Sprintf("平仓失败 %s %s: %v", symbol, side, err))
-			if firstErr == nil {
-				firstErr = err
+		if tighten {
+			if !tm.isTightening(symbol, side) {
+				log.Printf("%s %s 触发动量预警，收紧止盈", symbol, side)
 			}
+			tm.setTightening(symbol, side)
+		} else if tm.isTightening(symbol, side) {
+			tm.clearTightening(symbol, side)
+			log.Printf("%s %s 动量恢复，解除收紧", symbol, side)
 		}
 	}
 
@@ -1461,27 +1560,29 @@ func parseStringFloat(v interface{}) float64 {
 }
 
 type config struct {
-	concurrency      int
-	top              int
-	updateInterval   time.Duration
-	volumeRefresh    time.Duration
-	telegramToken    string
-	telegramChatID   string
-	watchCount       int
-	emaFastPeriod    int
-	emaSlowPeriod    int
-	macdFastPeriod   int
-	macdSlowPeriod   int
-	macdSignalPeriod int
-	adxPeriod        int
-	adxThreshold     float64
-	autoTrade        bool
-	orderQty         float64
-	maxPositions     int
-	leverage         int
-	recvWindow       int
-	apiKey           string
-	apiSecret        string
+	concurrency           int
+	top                   int
+	updateInterval        time.Duration
+	volumeRefresh         time.Duration
+	telegramToken         string
+	telegramChatID        string
+	watchCount            int
+	emaFastPeriod         int
+	emaSlowPeriod         int
+	macdFastPeriod        int
+	macdSlowPeriod        int
+	macdSignalPeriod      int
+	adxPeriod             int
+	adxThreshold          float64
+	emaDiffThreshold      float64
+	adxDirectionThreshold float64
+	autoTrade             bool
+	orderQty              float64
+	maxPositions          int
+	leverage              int
+	recvWindow            int
+	apiKey                string
+	apiSecret             string
 }
 
 func main() {
@@ -1553,6 +1654,8 @@ func parseConfig() config {
 	macdSignal := flag.Int("macd-signal", 9, "MACD 信号线 EMA 周期")
 	adxPeriod := flag.Int("adx-period", 14, "5m ADX 周期")
 	adxThreshold := flag.Float64("adx-threshold", 25, "ADX 趋势判断阈值")
+	emaDiffThreshold := flag.Float64("ema-diff-threshold", 0.0, "5m EMA 快慢线差值阈值")
+	adxDirectionThreshold := flag.Float64("adx-direction-threshold", 20.0, "5m ADX 最小值")
 	autoTrade := flag.Bool("auto-trade", true, "启用自动下单")
 	orderQty := flag.Float64("order-qty", 0, "每次下单的合约张数/数量")
 	maxPositions := flag.Int("max-positions", 10, "最大持仓数量")
@@ -1570,27 +1673,29 @@ func parseConfig() config {
 	}
 
 	cfg := config{
-		concurrency:      *concurrency,
-		top:              *top,
-		updateInterval:   *updateInterval,
-		volumeRefresh:    *volumeRefresh,
-		telegramToken:    os.Getenv("TELEGRAM_BOT_TOKEN"),
-		telegramChatID:   os.Getenv("TELEGRAM_CHAT_ID"),
-		watchCount:       *watchCount,
-		emaFastPeriod:    *emaFast,
-		emaSlowPeriod:    *emaSlow,
-		macdFastPeriod:   *macdFast,
-		macdSlowPeriod:   *macdSlow,
-		macdSignalPeriod: *macdSignal,
-		adxPeriod:        *adxPeriod,
-		adxThreshold:     *adxThreshold,
-		autoTrade:        *autoTrade,
-		orderQty:         qty,
-		maxPositions:     *maxPositions,
-		leverage:         *leverage,
-		recvWindow:       *recvWindow,
-		apiKey:           os.Getenv("BINANCE_API_KEY"),
-		apiSecret:        os.Getenv("BINANCE_API_SECRET"),
+		concurrency:           *concurrency,
+		top:                   *top,
+		updateInterval:        *updateInterval,
+		volumeRefresh:         *volumeRefresh,
+		telegramToken:         os.Getenv("TELEGRAM_BOT_TOKEN"),
+		telegramChatID:        os.Getenv("TELEGRAM_CHAT_ID"),
+		watchCount:            *watchCount,
+		emaFastPeriod:         *emaFast,
+		emaSlowPeriod:         *emaSlow,
+		macdFastPeriod:        *macdFast,
+		macdSlowPeriod:        *macdSlow,
+		macdSignalPeriod:      *macdSignal,
+		adxPeriod:             *adxPeriod,
+		adxThreshold:          *adxThreshold,
+		emaDiffThreshold:      *emaDiffThreshold,
+		adxDirectionThreshold: *adxDirectionThreshold,
+		autoTrade:             *autoTrade,
+		orderQty:              qty,
+		maxPositions:          *maxPositions,
+		leverage:              *leverage,
+		recvWindow:            *recvWindow,
+		apiKey:                os.Getenv("BINANCE_API_KEY"),
+		apiSecret:             os.Getenv("BINANCE_API_SECRET"),
 	}
 	if cfg.concurrency < 1 {
 		cfg.concurrency = 1
@@ -1630,6 +1735,12 @@ func parseConfig() config {
 	}
 	if cfg.adxThreshold <= 0 {
 		cfg.adxThreshold = 25
+	}
+	if cfg.emaDiffThreshold < 0 {
+		cfg.emaDiffThreshold = 0
+	}
+	if cfg.adxDirectionThreshold <= 0 {
+		cfg.adxDirectionThreshold = 20
 	}
 	if cfg.maxPositions < 1 {
 		cfg.maxPositions = 10
@@ -2327,6 +2438,12 @@ func computeTimeframeAnalysis(interval string, candles []candle, cfg config) (ti
 	signalPrev := macdSignalSeries[lastIdx-1]
 	macdHist := macdCurrent - signalCurrent
 	macdHistPrev := macdPrev - signalPrev
+	macdHistPrevPrev := macdHistPrev
+	if lastIdx >= 2 {
+		macdPrevPrevLine := macdLine[lastIdx-2]
+		signalPrevPrev := macdSignalSeries[lastIdx-2]
+		macdHistPrevPrev = macdPrevPrevLine - signalPrevPrev
+	}
 
 	adxVal, err := computeADX(clean, cfg.adxPeriod)
 	if err != nil {
@@ -2339,9 +2456,32 @@ func computeTimeframeAnalysis(interval string, candles []candle, cfg config) (ti
 	analysis.EMASlowSlope = slowCurrent - slowPrev
 	analysis.MACDHist = macdHist
 	analysis.MACDPrev = macdHistPrev
+	analysis.MACDPrevPrev = macdHistPrevPrev
+
+	adxPrev := adxVal
+	if len(clean) > cfg.adxPeriod+1 {
+		if val, err := computeADX(clean[:len(clean)-1], cfg.adxPeriod); err == nil {
+			adxPrev = val
+		}
+	}
+	adxPrev2 := adxPrev
+	if len(clean) > cfg.adxPeriod+2 {
+		if val, err := computeADX(clean[:len(clean)-2], cfg.adxPeriod); err == nil {
+			adxPrev2 = val
+		}
+	}
+	adxPrev3 := adxPrev2
+	if len(clean) > cfg.adxPeriod+3 {
+		if val, err := computeADX(clean[:len(clean)-3], cfg.adxPeriod); err == nil {
+			adxPrev3 = val
+		}
+	}
 	analysis.ADX = adxVal
-	analysis.LongSignal = fastCurrent > slowCurrent && analysis.EMAFastSlope > 0 && analysis.EMASlowSlope > 0 && macdHist > 0 && macdHist > macdHistPrev && adxVal > cfg.adxThreshold
-	analysis.ShortSignal = fastCurrent < slowCurrent && analysis.EMAFastSlope < 0 && analysis.EMASlowSlope < 0 && macdHist < 0 && macdHist < macdHistPrev && adxVal > cfg.adxThreshold
+	analysis.ADXPrev = adxPrev
+	analysis.ADXPrev2 = adxPrev2
+	analysis.ADXPrev3 = adxPrev3
+	analysis.LongSignal = false
+	analysis.ShortSignal = false
 	return analysis, nil
 }
 
@@ -2416,19 +2556,74 @@ func computeStrategyFromCandles(symbol string, candles3m, candles5m []candle, cf
 
 	result.ThreeMinute = threeMinute
 	result.FiveMinute = fiveMinute
-	result.LongSignal = threeMinute.LongSignal && fiveMinute.LongSignal
-	result.ShortSignal = threeMinute.ShortSignal && fiveMinute.ShortSignal
-	if result.LongSignal {
-		score3m := scoreTimeframe(threeMinute, cfg.adxThreshold, true)
-		score5m := scoreTimeframe(fiveMinute, cfg.adxThreshold, true)
-		result.Score = score3m*1.2 + score5m
-	} else if result.ShortSignal {
-		score3m := scoreTimeframe(threeMinute, cfg.adxThreshold, false)
-		score5m := scoreTimeframe(fiveMinute, cfg.adxThreshold, false)
-		result.Score = score3m*1.2 + score5m
-	} else {
-		result.Score = 0
+
+	emaDiffLong := fiveMinute.EMAFast - fiveMinute.EMASlow
+	emaDiffShort := fiveMinute.EMASlow - fiveMinute.EMAFast
+	adxThreshold := cfg.adxDirectionThreshold
+	if adxThreshold < 22 {
+		adxThreshold = 22
 	}
+	adxDelta3 := fiveMinute.ADX - fiveMinute.ADXPrev3
+	adxRising := fiveMinute.ADX >= adxThreshold && adxDelta3 > 0
+
+	longDirection := fiveMinute.EMAFast > fiveMinute.EMASlow && emaDiffLong > cfg.emaDiffThreshold && adxRising
+	shortDirection := fiveMinute.EMAFast < fiveMinute.EMASlow && emaDiffShort > cfg.emaDiffThreshold && adxRising
+
+	macdCrossLong := threeMinute.MACDHist > 0 && threeMinute.MACDPrev <= 0
+	macdCrossShort := threeMinute.MACDHist < 0 && threeMinute.MACDPrev >= 0
+
+	emaBounceLong := false
+	emaBounceShort := false
+	if len(clean3) > 1 {
+		prev := clean3[len(clean3)-2]
+		last := clean3[len(clean3)-1]
+		emaBounceLong = prev.Close <= threeMinute.EMAFast && last.Close > threeMinute.EMAFast
+		emaBounceShort = prev.Close >= threeMinute.EMAFast && last.Close < threeMinute.EMAFast
+	}
+
+	timingLong := macdCrossLong || emaBounceLong
+	timingShort := macdCrossShort || emaBounceShort
+
+	result.LongSignal = longDirection && timingLong
+	result.ShortSignal = shortDirection && timingShort
+
+	result.Score = 0
+	if result.LongSignal {
+		diffScore := emaDiffLong - cfg.emaDiffThreshold
+		if diffScore < 0 {
+			diffScore = 0
+		}
+		adxScore := fiveMinute.ADX - cfg.adxDirectionThreshold
+		if adxScore < 0 {
+			adxScore = 0
+		}
+		crossScore := 0.0
+		if macdCrossLong {
+			crossScore += math.Abs(threeMinute.MACDHist)
+		}
+		if emaBounceLong {
+			crossScore += math.Abs(clean3[len(clean3)-1].Close - threeMinute.EMAFast)
+		}
+		result.Score = diffScore + adxScore + crossScore
+	} else if result.ShortSignal {
+		diffScore := emaDiffShort - cfg.emaDiffThreshold
+		if diffScore < 0 {
+			diffScore = 0
+		}
+		adxScore := fiveMinute.ADX - cfg.adxDirectionThreshold
+		if adxScore < 0 {
+			adxScore = 0
+		}
+		crossScore := 0.0
+		if macdCrossShort {
+			crossScore += math.Abs(threeMinute.MACDHist)
+		}
+		if emaBounceShort {
+			crossScore += math.Abs(clean3[len(clean3)-1].Close - threeMinute.EMAFast)
+		}
+		result.Score = diffScore + adxScore + crossScore
+	}
+
 	return result, nil
 }
 
