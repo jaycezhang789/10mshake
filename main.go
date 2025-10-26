@@ -855,9 +855,6 @@ func (tm *tradeManager) OnCandleUpdate(symbol string) {
 	if symbol == "" {
 		return
 	}
-	if !tm.positions.Has(symbol, "LONG") && !tm.positions.Has(symbol, "SHORT") {
-		return
-	}
 	go tm.handleCandleUpdate(symbol)
 }
 
@@ -866,6 +863,9 @@ func (tm *tradeManager) handleCandleUpdate(symbol string) {
 	defer cancel()
 	if err := tm.checkPositionForSymbol(ctx, symbol); err != nil {
 		log.Printf("基于1m更新检查持仓失败 %s: %v", symbol, err)
+	}
+	if err := tm.evaluateOpenForSymbol(ctx, symbol); err != nil {
+		log.Printf("基于1m更新评估开仓失败 %s: %v", symbol, err)
 	}
 }
 
@@ -905,6 +905,46 @@ func (tm *tradeManager) checkPositionForSymbol(ctx context.Context, symbol strin
 		if err := tm.closePosition(ctx, symbol, "SHORT"); err != nil {
 			log.Printf("1m 平空失败 %s: %v", symbol, err)
 			tm.notifyError(ctx, fmt.Sprintf("平空失败 %s: %v", symbol, err))
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string) error {
+	if tm == nil || tm.watchMgr == nil {
+		return nil
+	}
+	if tm.positions.Remaining() <= 0 {
+		return nil
+	}
+	sr, err := computeStrategyForSymbol(ctx, tm.watchMgr, symbol, tm.cfg)
+	if err != nil {
+		return err
+	}
+	price := sr.Metrics.Last
+	if price <= 0 {
+		return nil
+	}
+	var firstErr error
+	if sr.LongSignal && !tm.positions.Has(symbol, "LONG") {
+		if err := tm.openPosition(ctx, symbol, "LONG", price); err != nil {
+			log.Printf("实时开多失败 %s: %v", symbol, err)
+			tm.notifyError(ctx, fmt.Sprintf("开多失败 %s: %v", symbol, err))
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	if tm.positions.Remaining() <= 0 {
+		return firstErr
+	}
+	if sr.ShortSignal && !tm.positions.Has(symbol, "SHORT") {
+		if err := tm.openPosition(ctx, symbol, "SHORT", price); err != nil {
+			log.Printf("实时开空失败 %s: %v", symbol, err)
+			tm.notifyError(ctx, fmt.Sprintf("开空失败 %s: %v", symbol, err))
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -2311,7 +2351,8 @@ func aggregateTo5m(candles []candle) []candle {
 	var current candle
 	var bucket time.Time
 	count := 0
-	for _, c := range candles {
+	lastIdx := len(candles) - 1
+	for idx, c := range candles {
 		b := c.OpenTime.Truncate(5 * time.Minute)
 		if count == 0 || !b.Equal(bucket) {
 			if count > 0 {
@@ -2328,20 +2369,22 @@ func aggregateTo5m(candles []candle) []candle {
 				Volume:    c.Volume,
 			}
 			count = 1
-			continue
+		} else {
+			if c.High > current.High {
+				current.High = c.High
+			}
+			if c.Low < current.Low {
+				current.Low = c.Low
+			}
+			current.Close = c.Close
+			current.Volume += c.Volume
+			count++
 		}
-		if c.High > current.High {
-			current.High = c.High
+		if idx == lastIdx {
+			if count >= 5 || c.OpenTime.Sub(bucket) >= 4*time.Minute {
+				aggregated = append(aggregated, current)
+			}
 		}
-		if c.Low < current.Low {
-			current.Low = c.Low
-		}
-		current.Close = c.Close
-		current.Volume += c.Volume
-		count++
-	}
-	if count > 0 {
-		aggregated = append(aggregated, current)
 	}
 	return aggregated
 }
