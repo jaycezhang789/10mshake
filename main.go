@@ -36,8 +36,25 @@ const (
 )
 
 const (
-	initialKlineLimit  = 499
-	positionKlineLimit = 499
+	initialKlineLimit           = 499
+	positionKlineLimit          = 499
+	macdStdMultiplier           = 0.15
+	sepEnterThreshold           = 0.8
+	sepExitThreshold            = 0.5
+	reentryResetATRMultiplier   = 0.4
+	reentryReentryATRMultiplier = 0.6
+	minBarsHeld                 = 3
+	reentryCooldownBars         = 6
+	choppinessThreshold         = 61.0
+	choppinessAdxMax            = 18.0
+	spreadAtrThreshold          = 0.07
+	depthNotionalThreshold      = 200000.0
+	btcVolMultiplier            = 3.0
+	btcCooloffDuration          = 15 * time.Minute
+)
+
+var (
+	minHoldDuration = time.Duration(minBarsHeld) * 3 * time.Minute
 )
 
 type exchangeInfoResp struct {
@@ -76,30 +93,44 @@ type candle struct {
 }
 
 type timeframeAnalysis struct {
-	Interval     string
-	EMAFast      float64
-	EMASlow      float64
-	EMAFastSlope float64
-	EMASlowSlope float64
-	MACDHist     float64
-	MACDPrev     float64
-	MACDPrevPrev float64
-	ADX          float64
-	ADXPrev      float64
-	ADXPrev2     float64
-	ADXPrev3     float64
-	LongSignal   bool
-	ShortSignal  bool
+	Interval      string
+	EMAFast       float64
+	EMASlow       float64
+	EMAFastSlope  float64
+	EMASlowSlope  float64
+	MACDHist      float64
+	MACDPrev      float64
+	MACDPrevPrev  float64
+	ADX           float64
+	ADXPrev       float64
+	ADXPrev2      float64
+	ADXPrev3      float64
+	MACDStd200    float64
+	MACDEpsilon   float64
+	ATR50         float64
+	ATR22         float64
+	HighestHigh22 float64
+	LowestLow22   float64
+	Choppiness    float64
+	Sep           float64
+	LongSignal    bool
+	ShortSignal   bool
 }
 
 type strategyResult struct {
-	Symbol      string
-	Metrics     symbolMetrics
-	ThreeMinute timeframeAnalysis
-	FiveMinute  timeframeAnalysis
-	LongSignal  bool
-	ShortSignal bool
-	Score       float64
+	Symbol        string
+	Metrics       symbolMetrics
+	ThreeMinute   timeframeAnalysis
+	FiveMinute    timeframeAnalysis
+	LongSignal    bool
+	ShortSignal   bool
+	Score         float64
+	Last3mBarID   string
+	Last5mBarID   string
+	EntryBlocked  bool
+	BlockReasons  []string
+	SpreadRatio   float64
+	DepthNotional float64
 }
 
 type intervalWatcher struct {
@@ -713,6 +744,40 @@ type orderRequest struct {
 	Quantity     float64
 }
 
+type reentryState struct {
+	State             string
+	LastExitPrice     float64
+	LastExitTime      time.Time
+	LastExitType      string
+	CooldownRemaining int
+}
+
+const (
+	reentryStateNone  = ""
+	reentryStateExit  = "exit"
+	reentryStateReset = "reset"
+)
+
+const (
+	exitTypeSoft = "soft"
+	exitTypeHard = "hard"
+)
+
+type trailingStop struct {
+	CE          float64
+	Peak        float64
+	InitialRisk float64
+	Multiplier  float64
+	LastUpdated time.Time
+}
+
+type candleSnapshot struct {
+	Strategy strategyResult
+	Last3ID  string
+	Last5ID  string
+	Created  time.Time
+}
+
 func (c *binanceClient) PlaceOrder(ctx context.Context, req orderRequest) error {
 	params := url.Values{}
 	params.Set("symbol", req.Symbol)
@@ -764,6 +829,49 @@ func (c *binanceClient) FetchOpenPositions(ctx context.Context) ([]positionEntry
 
 func formatQuantity(q float64) string {
 	return strconv.FormatFloat(q, 'f', -1, 64)
+}
+
+func (c *binanceClient) FetchDepth(ctx context.Context, symbol string) (bestBid, bestAsk, bidNotional, askNotional float64, err error) {
+	params := url.Values{}
+	params.Set("symbol", strings.ToUpper(symbol))
+	params.Set("limit", "10")
+	body, err := c.publicRequest(ctx, "/fapi/v1/depth", params)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	var resp struct {
+		Bids [][]string `json:"bids"`
+		Asks [][]string `json:"asks"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	if len(resp.Bids) == 0 || len(resp.Asks) == 0 {
+		return 0, 0, 0, 0, fmt.Errorf("orderbook 数据不足")
+	}
+	parseLevel := func(level []string) (float64, float64) {
+		if len(level) < 2 {
+			return 0, 0
+		}
+		price, _ := strconv.ParseFloat(level[0], 64)
+		qty, _ := strconv.ParseFloat(level[1], 64)
+		return price, qty
+	}
+	for i, level := range resp.Bids {
+		price, qty := parseLevel(level)
+		if i == 0 {
+			bestBid = price
+		}
+		bidNotional += price * qty
+	}
+	for i, level := range resp.Asks {
+		price, qty := parseLevel(level)
+		if i == 0 {
+			bestAsk = price
+		}
+		askNotional += price * qty
+	}
+	return
 }
 
 type positionKey struct {
@@ -870,31 +978,52 @@ func (pm *positionManager) Entries() []positionEntry {
 }
 
 type tradeManager struct {
-	client     *binanceClient
-	positions  *positionManager
-	cfg        config
-	qtyMu      sync.RWMutex
-	qty        map[string]float64
-	httpClient *http.Client
-	watchMgr   *symbolManager
-	cooldownMu sync.RWMutex
-	cooldown   map[string]int
-	tightenMu  sync.RWMutex
-	tightened  map[string]bool
+	client           *binanceClient
+	positions        *positionManager
+	cfg              config
+	qtyMu            sync.RWMutex
+	qty              map[string]float64
+	httpClient       *http.Client
+	watchMgr         *symbolManager
+	cooldownMu       sync.RWMutex
+	cooldown         map[string]int
+	tightenMu        sync.RWMutex
+	tightened        map[string]bool
+	reentryMu        sync.RWMutex
+	reentry          map[string]reentryState
+	entryMu          sync.RWMutex
+	entry            map[string]time.Time
+	trailingMu       sync.RWMutex
+	trailing         map[string]trailingStop
+	volMu            sync.Mutex
+	btcCooloffUntil  time.Time
+	lastBtcCheck     time.Time
+	snapshotMu       sync.RWMutex
+	snapshots        map[string]candleSnapshot
+	lastEvalMu       sync.Mutex
+	lastEvaluated    map[string]string
+	recentlyClosedMu sync.RWMutex
+	recentlyClosed   map[string]time.Time
 }
 
 func newTradeManager(client *binanceClient, positions []positionEntry, cfg config, httpClient *http.Client, watchMgr *symbolManager) *tradeManager {
 	pm := newPositionManager(cfg.maxPositions)
 	pm.Replace(positions)
 	return &tradeManager{
-		client:     client,
-		positions:  pm,
-		cfg:        cfg,
-		qty:        make(map[string]float64),
-		httpClient: httpClient,
-		watchMgr:   watchMgr,
-		cooldown:   make(map[string]int),
-		tightened:  make(map[string]bool),
+		client:         client,
+		positions:      pm,
+		cfg:            cfg,
+		qty:            make(map[string]float64),
+		httpClient:     httpClient,
+		watchMgr:       watchMgr,
+		cooldown:       make(map[string]int),
+		tightened:      make(map[string]bool),
+		reentry:        make(map[string]reentryState),
+		entry:          make(map[string]time.Time),
+		trailing:       make(map[string]trailingStop),
+		snapshots:      make(map[string]candleSnapshot),
+		lastEvaluated:  make(map[string]string),
+		recentlyClosed: make(map[string]time.Time),
 	}
 }
 
@@ -917,6 +1046,7 @@ func (tm *tradeManager) clearTightening(symbol, side string) {
 		delete(tm.tightened, tm.tightenKey(symbol, side))
 	}
 	tm.tightenMu.Unlock()
+	tm.clearTrailing(symbol, side)
 }
 
 func (tm *tradeManager) isTightening(symbol, side string) bool {
@@ -928,35 +1058,524 @@ func (tm *tradeManager) isTightening(symbol, side string) bool {
 	return tm.tightened[tm.tightenKey(symbol, side)]
 }
 
-func shouldTightenPosition(side string, sr strategyResult) bool {
+func (tm *tradeManager) reentryKey(symbol, side string) string {
+	return strings.ToUpper(symbol) + "::" + strings.ToUpper(side)
+}
+
+func (tm *tradeManager) markReentryExit(symbol, side string, price float64, exitType string) {
+	if strings.ToUpper(side) != "LONG" && strings.ToUpper(side) != "SHORT" {
+		return
+	}
+	tm.markRecentlyClosed(symbol, side)
+	tm.reentryMu.Lock()
+	if tm.reentry == nil {
+		tm.reentry = make(map[string]reentryState)
+	}
+	cooldown := reentryCooldownBars
+	if cooldown < 0 {
+		cooldown = 0
+	}
+	tm.reentry[tm.reentryKey(symbol, side)] = reentryState{
+		State:             reentryStateExit,
+		LastExitPrice:     price,
+		LastExitTime:      time.Now(),
+		LastExitType:      exitType,
+		CooldownRemaining: cooldown,
+	}
+	tm.reentryMu.Unlock()
+}
+
+func (tm *tradeManager) clearReentryState(symbol, side string) {
+	tm.reentryMu.Lock()
+	if tm.reentry != nil {
+		delete(tm.reentry, tm.reentryKey(symbol, side))
+	}
+	tm.reentryMu.Unlock()
+	tm.clearRecentlyClosed(symbol, side)
+}
+
+func (tm *tradeManager) recentlyClosedKey(symbol, side string) string {
+	return strings.ToUpper(symbol) + "::" + strings.ToUpper(side)
+}
+
+func (tm *tradeManager) markRecentlyClosed(symbol, side string) {
+	tm.recentlyClosedMu.Lock()
+	if tm.recentlyClosed == nil {
+		tm.recentlyClosed = make(map[string]time.Time)
+	}
+	tm.recentlyClosed[tm.recentlyClosedKey(symbol, side)] = time.Now()
+	tm.recentlyClosedMu.Unlock()
+}
+
+func (tm *tradeManager) clearRecentlyClosed(symbol, side string) {
+	tm.recentlyClosedMu.Lock()
+	if tm.recentlyClosed != nil {
+		delete(tm.recentlyClosed, tm.recentlyClosedKey(symbol, side))
+	}
+	tm.recentlyClosedMu.Unlock()
+}
+
+func (tm *tradeManager) isRecentlyClosed(symbol, side string) bool {
+	tm.recentlyClosedMu.RLock()
+	defer tm.recentlyClosedMu.RUnlock()
+	if tm.recentlyClosed == nil {
+		return false
+	}
+	_, ok := tm.recentlyClosed[tm.recentlyClosedKey(symbol, side)]
+	return ok
+}
+
+func (tm *tradeManager) storeSnapshot(sr strategyResult) {
+	if strings.TrimSpace(sr.Symbol) == "" {
+		return
+	}
+	tm.snapshotMu.Lock()
+	if tm.snapshots == nil {
+		tm.snapshots = make(map[string]candleSnapshot)
+	}
+	tm.snapshots[strings.ToUpper(sr.Symbol)] = candleSnapshot{Strategy: sr, Last3ID: sr.Last3mBarID, Last5ID: sr.Last5mBarID, Created: time.Now()}
+	tm.snapshotMu.Unlock()
+}
+
+func (tm *tradeManager) getSnapshot(symbol string) (strategyResult, bool) {
+	tm.snapshotMu.RLock()
+	defer tm.snapshotMu.RUnlock()
+	if tm.snapshots == nil {
+		return strategyResult{}, false
+	}
+	ss, ok := tm.snapshots[strings.ToUpper(symbol)]
+	if !ok {
+		return strategyResult{}, false
+	}
+	return ss.Strategy, true
+}
+
+func (tm *tradeManager) shouldEvaluateSymbolKey(symbol, key string) bool {
+	tm.lastEvalMu.Lock()
+	defer tm.lastEvalMu.Unlock()
+	if tm.lastEvaluated == nil {
+		tm.lastEvaluated = make(map[string]string)
+	}
+	symbol = strings.ToUpper(symbol)
+	if prev, ok := tm.lastEvaluated[symbol]; ok && prev == key {
+		return false
+	}
+	tm.lastEvaluated[symbol] = key
+	return true
+}
+
+func (tm *tradeManager) updateReentryReset(symbol, side string, sr strategyResult) {
+	if tm.positions != nil && tm.positions.Has(symbol, side) {
+		tm.clearReentryState(symbol, side)
+		return
+	}
+	tm.reentryMu.Lock()
+	defer tm.reentryMu.Unlock()
+	if tm.reentry == nil {
+		tm.reentry = make(map[string]reentryState)
+	}
+	key := tm.reentryKey(symbol, side)
+	state, ok := tm.reentry[key]
+	if !ok || state.State != reentryStateExit {
+		return
+	}
+	if tm.resetConditionMet(side, sr) {
+		if state.State != reentryStateReset {
+			state.State = reentryStateReset
+			tm.reentry[key] = state
+			log.Printf("%s %s 满足回撤确认，允许重入", symbol, side)
+		}
+	}
+}
+
+func (tm *tradeManager) resetConditionMet(side string, sr strategyResult) bool {
+	price := sr.Metrics.Last
+	atr := sr.ThreeMinute.ATR50
+	epsilon := sr.ThreeMinute.MACDEpsilon
+	if epsilon < 0 {
+		epsilon = 0
+	}
 	switch strings.ToUpper(side) {
 	case "LONG":
-		weakening := sr.ThreeMinute.MACDHist > 0 &&
-			sr.ThreeMinute.MACDPrev > 0 &&
-			sr.ThreeMinute.MACDPrevPrev > 0 &&
-			sr.ThreeMinute.MACDHist < sr.ThreeMinute.MACDPrev &&
-			sr.ThreeMinute.MACDPrev < sr.ThreeMinute.MACDPrevPrev
-		adxFlat := sr.FiveMinute.ADX <= sr.FiveMinute.ADXPrev
-		return weakening && adxFlat
+		priceTrigger := atr > 0 && price <= sr.ThreeMinute.EMAFast-reentryResetATRMultiplier*atr
+		macdTrigger := sr.ThreeMinute.MACDHist <= -epsilon
+		return macdTrigger || priceTrigger
 	case "SHORT":
-		weakening := sr.ThreeMinute.MACDHist < 0 &&
-			sr.ThreeMinute.MACDPrev < 0 &&
-			sr.ThreeMinute.MACDPrevPrev < 0 &&
-			sr.ThreeMinute.MACDHist > sr.ThreeMinute.MACDPrev &&
-			sr.ThreeMinute.MACDPrev > sr.ThreeMinute.MACDPrevPrev
-		adxFlat := sr.FiveMinute.ADX <= sr.FiveMinute.ADXPrev
-		return weakening && adxFlat
+		priceTrigger := atr > 0 && price >= sr.ThreeMinute.EMAFast+reentryResetATRMultiplier*atr
+		macdTrigger := sr.ThreeMinute.MACDHist >= epsilon
+		return macdTrigger || priceTrigger
 	default:
 		return false
 	}
 }
 
-func shouldClosePosition(side string, sr strategyResult) bool {
+func (tm *tradeManager) trailingKey(symbol, side string) string {
+	return strings.ToUpper(symbol) + "::" + strings.ToUpper(side)
+}
+
+func chandelierMultiplier(sr strategyResult) float64 {
+	adx := sr.FiveMinute.ADX
+	sep := math.Abs(sr.FiveMinute.Sep)
+	if adx >= 32 || sep >= 1.0 {
+		return 2.8
+	}
+	return 2.1
+}
+
+func (tm *tradeManager) clearTrailing(symbol, side string) {
+	tm.trailingMu.Lock()
+	if tm.trailing != nil {
+		delete(tm.trailing, tm.trailingKey(symbol, side))
+	}
+	tm.trailingMu.Unlock()
+}
+
+func (tm *tradeManager) getTrailing(symbol, side string) (trailingStop, bool) {
+	tm.trailingMu.RLock()
+	defer tm.trailingMu.RUnlock()
+	if tm.trailing == nil {
+		return trailingStop{}, false
+	}
+	ts, ok := tm.trailing[tm.trailingKey(symbol, side)]
+	return ts, ok
+}
+
+func (tm *tradeManager) ensureTrailing(symbol, side string, sr strategyResult) {
+	if sr.ThreeMinute.ATR22 <= 0 {
+		return
+	}
+	mult := chandelierMultiplier(sr)
+	price := sr.Metrics.Last
+	var ce, peak, risk float64
 	switch strings.ToUpper(side) {
 	case "LONG":
-		return sr.ThreeMinute.MACDHist <= 0 && sr.FiveMinute.EMAFastSlope <= 0
+		high := sr.ThreeMinute.HighestHigh22
+		ce = high - mult*sr.ThreeMinute.ATR22
+		peak = high
+		risk = price - ce
 	case "SHORT":
-		return sr.ThreeMinute.MACDHist >= 0 && sr.FiveMinute.EMAFastSlope >= 0
+		low := sr.ThreeMinute.LowestLow22
+		ce = low + mult*sr.ThreeMinute.ATR22
+		peak = low
+		risk = ce - price
+	default:
+		return
+	}
+	if risk <= 0 {
+		risk = math.Abs(price) * 1e-4
+	}
+	tm.trailingMu.Lock()
+	if tm.trailing == nil {
+		tm.trailing = make(map[string]trailingStop)
+	}
+	key := tm.trailingKey(symbol, side)
+	state, ok := tm.trailing[key]
+	if !ok {
+		tm.trailing[key] = trailingStop{CE: ce, Peak: peak, InitialRisk: risk, Multiplier: mult, LastUpdated: time.Now()}
+		tm.trailingMu.Unlock()
+		return
+	}
+	state.Multiplier = mult
+	state.LastUpdated = time.Now()
+	if strings.ToUpper(side) == "LONG" {
+		if ce > state.CE {
+			state.CE = ce
+		}
+		if peak > state.Peak {
+			state.Peak = peak
+		}
+		if risk > state.InitialRisk {
+			state.InitialRisk = risk
+		}
+	} else {
+		if ce < state.CE {
+			state.CE = ce
+		}
+		if peak < state.Peak || state.Peak == 0 {
+			state.Peak = peak
+		}
+		if risk > state.InitialRisk {
+			state.InitialRisk = risk
+		}
+	}
+	tm.trailing[key] = state
+	tm.trailingMu.Unlock()
+}
+
+func (tm *tradeManager) updateTrailing(symbol, side string, sr strategyResult) {
+	if !tm.isTightening(symbol, side) {
+		tm.clearTrailing(symbol, side)
+		return
+	}
+	tm.ensureTrailing(symbol, side, sr)
+}
+
+func (tm *tradeManager) canEnterAfterReset(symbol, side string, sr strategyResult) bool {
+	tm.reentryMu.RLock()
+	state, ok := tm.reentry[tm.reentryKey(symbol, side)]
+	tm.reentryMu.RUnlock()
+	if !ok || state.State == reentryStateNone {
+		return true
+	}
+	if state.State == reentryStateExit {
+		return false
+	}
+	// reentryStateReset
+	price := sr.Metrics.Last
+	atr := sr.ThreeMinute.ATR50
+	threshold := atr * reentryReentryATRMultiplier
+	if atr <= 0 {
+		threshold = 0
+	}
+	if state.CooldownRemaining > 0 {
+		return false
+	}
+	if tm.isRecentlyClosed(symbol, side) && (state.State != reentryStateReset || state.CooldownRemaining > 0) {
+		return false
+	}
+	switch strings.ToUpper(side) {
+	case "LONG":
+		minPrice := state.LastExitPrice + threshold
+		if threshold <= 0 {
+			minPrice = state.LastExitPrice * (1 + 1e-6)
+		}
+		if price <= minPrice {
+			return false
+		}
+	case "SHORT":
+		maxPrice := state.LastExitPrice - threshold
+		if threshold <= 0 {
+			maxPrice = state.LastExitPrice * (1 - 1e-6)
+		}
+		if price >= maxPrice {
+			return false
+		}
+	default:
+		return false
+	}
+	return true
+}
+
+func (tm *tradeManager) entryKey(symbol, side string) string {
+	return strings.ToUpper(symbol) + "::" + strings.ToUpper(side)
+}
+
+func (tm *tradeManager) setEntryTime(symbol, side string, t time.Time) {
+	tm.entryMu.Lock()
+	if tm.entry == nil {
+		tm.entry = make(map[string]time.Time)
+	}
+	tm.entry[tm.entryKey(symbol, side)] = t
+	tm.entryMu.Unlock()
+}
+
+func (tm *tradeManager) clearEntryTime(symbol, side string) {
+	tm.entryMu.Lock()
+	if tm.entry != nil {
+		delete(tm.entry, tm.entryKey(symbol, side))
+	}
+	tm.entryMu.Unlock()
+}
+
+func (tm *tradeManager) getEntryTime(symbol, side string) time.Time {
+	tm.entryMu.RLock()
+	defer tm.entryMu.RUnlock()
+	if tm.entry == nil {
+		return time.Time{}
+	}
+	if t, ok := tm.entry[tm.entryKey(symbol, side)]; ok {
+		return t
+	}
+	return time.Time{}
+}
+
+func (tm *tradeManager) canSoftExit(symbol, side string) bool {
+	if minBarsHeld <= 0 || minHoldDuration <= 0 {
+		return true
+	}
+	entry := tm.getEntryTime(symbol, side)
+	if entry.IsZero() {
+		return true
+	}
+	now := time.Now()
+	if entry.After(now) {
+		return true
+	}
+	if now.Sub(entry) < minHoldDuration {
+		return false
+	}
+	return true
+}
+
+func (tm *tradeManager) syncEntryTimes(entries []positionEntry) {
+	tm.entryMu.Lock()
+	defer tm.entryMu.Unlock()
+	if tm.entry == nil {
+		tm.entry = make(map[string]time.Time)
+	}
+	active := make(map[string]struct{}, len(entries))
+	now := time.Now()
+	for _, entry := range entries {
+		key := tm.entryKey(entry.Symbol, entry.Side)
+		active[key] = struct{}{}
+		if _, ok := tm.entry[key]; !ok {
+			if minHoldDuration > 0 {
+				tm.entry[key] = now.Add(-minHoldDuration)
+			} else {
+				tm.entry[key] = now
+			}
+		}
+	}
+	for key := range tm.entry {
+		if _, ok := active[key]; !ok {
+			delete(tm.entry, key)
+		}
+	}
+}
+
+func (tm *tradeManager) tickReentryCooldown(symbol, interval string) {
+	if strings.ToLower(interval) != "3m" {
+		return
+	}
+	tm.reentryMu.Lock()
+	defer tm.reentryMu.Unlock()
+	if tm.reentry == nil {
+		return
+	}
+	for _, side := range []string{"LONG", "SHORT"} {
+		key := tm.reentryKey(symbol, side)
+		state, ok := tm.reentry[key]
+		if !ok || state.State == reentryStateNone || state.CooldownRemaining <= 0 {
+			continue
+		}
+		state.CooldownRemaining--
+		if state.CooldownRemaining < 0 {
+			state.CooldownRemaining = 0
+		}
+		tm.reentry[key] = state
+	}
+}
+
+func (tm *tradeManager) shouldChandelierExit(symbol, side string, sr strategyResult) bool {
+	if !tm.isTightening(symbol, side) {
+		return false
+	}
+	ts, ok := tm.getTrailing(symbol, side)
+	if !ok {
+		return false
+	}
+	price := sr.Metrics.Last
+	switch strings.ToUpper(side) {
+	case "LONG":
+		return price <= ts.CE && ts.CE > 0
+	case "SHORT":
+		return price >= ts.CE && ts.CE > 0
+	default:
+		return false
+	}
+}
+
+func (tm *tradeManager) shouldConfirmExit(symbol, side string, sr strategyResult) bool {
+	if !tm.isTightening(symbol, side) {
+		return false
+	}
+	ts, ok := tm.getTrailing(symbol, side)
+	if !ok {
+		return false
+	}
+	atr := sr.ThreeMinute.ATR22
+	if atr <= 0 {
+		atr = sr.ThreeMinute.ATR50
+	}
+	price := sr.Metrics.Last
+	initialRisk := ts.InitialRisk
+	if initialRisk <= 0 {
+		initialRisk = atr
+	}
+	if initialRisk <= 0 {
+		initialRisk = math.Abs(price) * 1e-4
+	}
+	atrDrawdown := 1.8 * atr
+	profitDrawdownThreshold := 0.8 * initialRisk
+	sep := sr.FiveMinute.Sep
+	switch strings.ToUpper(side) {
+	case "LONG":
+		drawdown := ts.Peak - price
+		if drawdown < 0 {
+			drawdown = 0
+		}
+		if atrDrawdown > 0 && drawdown >= atrDrawdown {
+			return true
+		}
+		if profitDrawdownThreshold > 0 && drawdown >= profitDrawdownThreshold {
+			return true
+		}
+		if sep <= sepExitThreshold {
+			return true
+		}
+	case "SHORT":
+		drawdown := price - ts.Peak
+		if drawdown < 0 {
+			drawdown = 0
+		}
+		if atrDrawdown > 0 && drawdown >= atrDrawdown {
+			return true
+		}
+		if profitDrawdownThreshold > 0 && drawdown >= profitDrawdownThreshold {
+			return true
+		}
+		if sep >= -sepExitThreshold {
+			return true
+		}
+	default:
+		return false
+	}
+	return false
+}
+
+func shouldTightenPosition(side string, sr strategyResult) bool {
+	epsilon := sr.ThreeMinute.MACDEpsilon
+	if epsilon < 0 {
+		epsilon = 0
+	}
+	enterSep := sepEnterThreshold
+	switch strings.ToUpper(side) {
+	case "LONG":
+		weakening := sr.ThreeMinute.MACDHist > epsilon &&
+			sr.ThreeMinute.MACDPrev > epsilon &&
+			sr.ThreeMinute.MACDPrevPrev > epsilon &&
+			sr.ThreeMinute.MACDHist < sr.ThreeMinute.MACDPrev &&
+			sr.ThreeMinute.MACDPrev < sr.ThreeMinute.MACDPrevPrev
+		sepCooling := sr.FiveMinute.Sep < enterSep
+		return weakening && sepCooling
+	case "SHORT":
+		weakening := sr.ThreeMinute.MACDHist < -epsilon &&
+			sr.ThreeMinute.MACDPrev < -epsilon &&
+			sr.ThreeMinute.MACDPrevPrev < -epsilon &&
+			sr.ThreeMinute.MACDHist > sr.ThreeMinute.MACDPrev &&
+			sr.ThreeMinute.MACDPrev > sr.ThreeMinute.MACDPrevPrev
+		sepCooling := sr.FiveMinute.Sep > -enterSep
+		return weakening && sepCooling
+	default:
+		return false
+	}
+}
+
+func shouldBaselineExit(side string, sr strategyResult) bool {
+	epsilon := sr.ThreeMinute.MACDEpsilon
+	if epsilon < 0 {
+		epsilon = 0
+	}
+	exitSep := sepExitThreshold
+	switch strings.ToUpper(side) {
+	case "LONG":
+		histExit := sr.ThreeMinute.MACDHist < -epsilon
+		sepExit := sr.FiveMinute.Sep <= exitSep && sr.FiveMinute.EMAFastSlope <= 0
+		return histExit || sepExit
+	case "SHORT":
+		histExit := sr.ThreeMinute.MACDHist > epsilon
+		sepExit := sr.FiveMinute.Sep >= -exitSep && sr.FiveMinute.EMAFastSlope >= 0
+		return histExit || sepExit
 	default:
 		return false
 	}
@@ -1016,16 +1635,23 @@ func (tm *tradeManager) OnCandleUpdate(symbol, interval string) {
 func (tm *tradeManager) handleCandleUpdate(symbol, interval string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if err := tm.checkPositionForSymbol(ctx, symbol); err != nil {
-		log.Printf("基于3m更新检查持仓失败 %s: %v", symbol, err)
-	}
-	if err := tm.evaluateOpenForSymbol(ctx, symbol); err != nil {
-		log.Printf("基于3m更新评估开仓失败 %s: %v", symbol, err)
+	sr, err := computeStrategyForSymbol(ctx, tm.watchMgr, symbol, tm.cfg)
+	if err != nil {
+		log.Printf("获取 %s 策略数据失败: %v", symbol, err)
+	} else {
+		tm.storeSnapshot(sr)
+		if err := tm.checkPositionForSymbol(ctx, symbol, &sr); err != nil {
+			log.Printf("基于3m更新检查持仓失败 %s: %v", symbol, err)
+		}
+		if err := tm.evaluateOpenForSymbol(ctx, symbol, &sr); err != nil {
+			log.Printf("基于3m更新评估开仓失败 %s: %v", symbol, err)
+		}
 	}
 	tm.cooldownTick(symbol, interval)
+	tm.tickReentryCooldown(symbol, interval)
 }
 
-func (tm *tradeManager) checkPositionForSymbol(ctx context.Context, symbol string) error {
+func (tm *tradeManager) checkPositionForSymbol(ctx context.Context, symbol string, snapshot *strategyResult) error {
 	symbol = strings.ToUpper(symbol)
 	if symbol == "" || tm.watchMgr == nil {
 		return nil
@@ -1043,57 +1669,248 @@ func (tm *tradeManager) checkPositionForSymbol(ctx context.Context, symbol strin
 	if !hasLong && !hasShort {
 		return nil
 	}
-	sr, err := computeStrategyForSymbol(ctx, tm.watchMgr, symbol, tm.cfg)
-	if err != nil {
-		return err
+	var sr strategyResult
+	if snapshot != nil {
+		sr = *snapshot
+	} else if snap, ok := tm.getSnapshot(symbol); ok {
+		sr = snap
+	} else {
+		var err error
+		sr, err = computeStrategyForSymbol(ctx, tm.watchMgr, symbol, tm.cfg)
+		if err != nil {
+			return err
+		}
+		tm.storeSnapshot(sr)
 	}
 	var firstErr error
 	if hasLong {
-		if shouldClosePosition("LONG", sr) {
-			if err := tm.closePosition(ctx, symbol, "LONG"); err != nil {
-				log.Printf("3m 平多失败 %s: %v", symbol, err)
-				tm.notifyError(ctx, fmt.Sprintf("平多失败 %s: %v", symbol, err))
-				if firstErr == nil {
-					firstErr = err
-				}
-			} else {
-				tm.clearTightening(symbol, "LONG")
-			}
-		} else if shouldTightenPosition("LONG", sr) {
-			if !tm.isTightening(symbol, "LONG") {
-				log.Printf("%s LONG 触发动量预警，收紧止盈", symbol)
-			}
-			tm.setTightening(symbol, "LONG")
-		} else if tm.isTightening(symbol, "LONG") {
-			tm.clearTightening(symbol, "LONG")
-			log.Printf("%s LONG 动量恢复，解除收紧", symbol)
+		if err := tm.handleExitForSide(ctx, symbol, "LONG", sr, true); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	if hasShort {
-		if shouldClosePosition("SHORT", sr) {
-			if err := tm.closePosition(ctx, symbol, "SHORT"); err != nil {
-				log.Printf("3m 平空失败 %s: %v", symbol, err)
-				tm.notifyError(ctx, fmt.Sprintf("平空失败 %s: %v", symbol, err))
-				if firstErr == nil {
-					firstErr = err
-				}
-			} else {
-				tm.clearTightening(symbol, "SHORT")
-			}
-		} else if shouldTightenPosition("SHORT", sr) {
-			if !tm.isTightening(symbol, "SHORT") {
-				log.Printf("%s SHORT 触发动量预警，收紧止盈", symbol)
-			}
-			tm.setTightening(symbol, "SHORT")
-		} else if tm.isTightening(symbol, "SHORT") {
-			tm.clearTightening(symbol, "SHORT")
-			log.Printf("%s SHORT 动量恢复，解除收紧", symbol)
+		if err := tm.handleExitForSide(ctx, symbol, "SHORT", sr, true); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	return firstErr
 }
 
-func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string) error {
+func (tm *tradeManager) handleExitForSide(ctx context.Context, symbol, side string, sr strategyResult, allowBaseline bool) error {
+	side = strings.ToUpper(side)
+	if side != "LONG" && side != "SHORT" {
+		return nil
+	}
+	if !tm.positions.Has(symbol, side) {
+		return nil
+	}
+	tm.storeSnapshot(sr)
+	var firstErr error
+	sideLabel := "多"
+	if side == "SHORT" {
+		sideLabel = "空"
+	}
+	tm.updateTrailing(symbol, side, sr)
+	if tm.isTightening(symbol, side) {
+		if tm.shouldChandelierExit(symbol, side, sr) {
+			if err := tm.closePosition(ctx, symbol, side); err != nil {
+				log.Printf("吊灯平%s失败 %s: %v", sideLabel, symbol, err)
+				tm.notifyError(ctx, fmt.Sprintf("平仓失败 %s %s: %v", symbol, side, err))
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				tm.clearTightening(symbol, side)
+				tm.markReentryExit(symbol, side, sr.Metrics.Last, exitTypeHard)
+			}
+			return firstErr
+		}
+		closeConfirm := tm.shouldConfirmExit(symbol, side, sr)
+		if closeConfirm && !tm.canSoftExit(symbol, side) {
+			closeConfirm = false
+		}
+		if closeConfirm {
+			if err := tm.closePosition(ctx, symbol, side); err != nil {
+				log.Printf("平%s失败 %s: %v", sideLabel, symbol, err)
+				tm.notifyError(ctx, fmt.Sprintf("平仓失败 %s %s: %v", symbol, side, err))
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				tm.clearTightening(symbol, side)
+				tm.markReentryExit(symbol, side, sr.Metrics.Last, exitTypeSoft)
+			}
+			return firstErr
+		}
+		if shouldTightenPosition(side, sr) {
+			tm.setTightening(symbol, side)
+			tm.ensureTrailing(symbol, side, sr)
+		} else {
+			tm.clearTightening(symbol, side)
+			tm.clearTrailing(symbol, side)
+			log.Printf("%s %s 动量恢复，解除收紧", symbol, side)
+		}
+		return firstErr
+	}
+	if allowBaseline {
+		closeBaseline := shouldBaselineExit(side, sr)
+		if closeBaseline && !tm.canSoftExit(symbol, side) {
+			closeBaseline = false
+		}
+		if closeBaseline {
+			if err := tm.closePosition(ctx, symbol, side); err != nil {
+				log.Printf("平%s失败 %s: %v", sideLabel, symbol, err)
+				tm.notifyError(ctx, fmt.Sprintf("平仓失败 %s %s: %v", symbol, side, err))
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				tm.clearTightening(symbol, side)
+				tm.markReentryExit(symbol, side, sr.Metrics.Last, exitTypeSoft)
+			}
+			return firstErr
+		}
+	}
+	if shouldTightenPosition(side, sr) {
+		if !tm.isTightening(symbol, side) {
+			log.Printf("%s %s 触发动量预警，收紧止盈", symbol, side)
+		}
+		tm.setTightening(symbol, side)
+		tm.ensureTrailing(symbol, side, sr)
+	} else if tm.isTightening(symbol, side) {
+		tm.clearTightening(symbol, side)
+		tm.clearTrailing(symbol, side)
+		log.Printf("%s %s 动量恢复，解除收紧", symbol, side)
+	}
+	return firstErr
+}
+
+func (tm *tradeManager) evaluateEntryEnvironment(ctx context.Context, sr *strategyResult) bool {
+	if sr == nil {
+		return true
+	}
+	sr.EntryBlocked = false
+	sr.BlockReasons = nil
+	sr.SpreadRatio = 0
+	sr.DepthNotional = 0
+	allowed := true
+	if sr.FiveMinute.Choppiness > choppinessThreshold && sr.FiveMinute.ADX < choppinessAdxMax {
+		reason := fmt.Sprintf("震荡过滤 Choppiness=%.1f ADX=%.1f", sr.FiveMinute.Choppiness, sr.FiveMinute.ADX)
+		sr.BlockReasons = append(sr.BlockReasons, reason)
+		allowed = false
+	}
+	if ok := tm.checkBTCCooloff(ctx); !ok {
+		expiry := tm.getCooloffExpiry()
+		reason := "BTC 15m 波动检测失败"
+		if !expiry.IsZero() {
+			reason = fmt.Sprintf("BTC 15m 波动冷静期至 %s", expiry.Format("15:04"))
+		}
+		sr.BlockReasons = append(sr.BlockReasons, reason)
+		allowed = false
+	}
+	spreadAllowed := tm.assessSpreadAndDepth(ctx, sr)
+	if !spreadAllowed {
+		allowed = false
+	}
+	sr.EntryBlocked = !allowed
+	return allowed
+}
+
+func (tm *tradeManager) assessSpreadAndDepth(ctx context.Context, sr *strategyResult) bool {
+	if tm.client == nil || sr == nil {
+		return true
+	}
+	atr := sr.ThreeMinute.ATR22
+	if atr <= 0 {
+		atr = sr.ThreeMinute.ATR50
+	}
+	bestBid, bestAsk, bidNotional, askNotional, err := tm.client.FetchDepth(ctx, sr.Symbol)
+	if err != nil {
+		log.Printf("获取 %s 深度失败: %v", sr.Symbol, err)
+		sr.BlockReasons = append(sr.BlockReasons, "深度获取失败")
+		return false
+	}
+	if bestBid <= 0 || bestAsk <= 0 || bestAsk <= bestBid {
+		sr.BlockReasons = append(sr.BlockReasons, "报价异常")
+		return false
+	}
+	spread := bestAsk - bestBid
+	if atr > 0 {
+		sr.SpreadRatio = spread / atr
+	} else {
+		sr.SpreadRatio = math.Inf(1)
+	}
+	depth := math.Min(bidNotional, askNotional)
+	sr.DepthNotional = depth
+	allowed := true
+	if sr.SpreadRatio > spreadAtrThreshold {
+		allowed = false
+		sr.BlockReasons = append(sr.BlockReasons, fmt.Sprintf("点差占比 %.3f 超阈值 %.2f", sr.SpreadRatio, spreadAtrThreshold))
+	}
+	if depth < depthNotionalThreshold {
+		allowed = false
+		sr.BlockReasons = append(sr.BlockReasons, fmt.Sprintf("深度 %.0f < %.0f", depth, depthNotionalThreshold))
+	}
+	return allowed
+}
+
+func (tm *tradeManager) checkBTCCooloff(ctx context.Context) bool {
+	if tm.httpClient == nil {
+		return true
+	}
+	now := time.Now()
+	tm.volMu.Lock()
+	if now.Before(tm.btcCooloffUntil) {
+		tm.volMu.Unlock()
+		return false
+	}
+	if now.Sub(tm.lastBtcCheck) < time.Minute {
+		tm.volMu.Unlock()
+		return true
+	}
+	tm.lastBtcCheck = now
+	tm.volMu.Unlock()
+	candles, err := fetchHistoricalInterval(ctx, tm.httpClient, "BTCUSDT", "15m", 60)
+	if err != nil {
+		log.Printf("获取 BTC 15m 行情失败: %v", err)
+		return false
+	}
+	clean := dedupeCandles(candles)
+	if len(clean) < 52 {
+		return true
+	}
+	last := clean[len(clean)-1]
+	prev := clean[len(clean)-2]
+	highLow := last.High - last.Low
+	highClose := math.Abs(last.High - prev.Close)
+	lowClose := math.Abs(last.Low - prev.Close)
+	tr := math.Max(highLow, math.Max(highClose, lowClose))
+	atrSeries, err := computeATRSeries(clean, 50)
+	if err != nil || len(atrSeries) == 0 {
+		return true
+	}
+	atr := atrSeries[len(atrSeries)-1]
+	if atr <= 0 {
+		return true
+	}
+	if tr <= btcVolMultiplier*atr {
+		return true
+	}
+	expiry := time.Now().Add(btcCooloffDuration)
+	tm.volMu.Lock()
+	tm.btcCooloffUntil = expiry
+	tm.volMu.Unlock()
+	log.Printf("BTC 15m 波动触发冷静期，TR=%.4f ATR=%.4f，冷静期至 %s", tr, atr, expiry.Format(time.RFC3339))
+	return false
+}
+
+func (tm *tradeManager) getCooloffExpiry() time.Time {
+	tm.volMu.Lock()
+	defer tm.volMu.Unlock()
+	return tm.btcCooloffUntil
+}
+
+func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string, snapshot *strategyResult) error {
 	if tm == nil || tm.watchMgr == nil {
 		return nil
 	}
@@ -1103,10 +1920,21 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 	if tm.isCoolingDown(symbol) {
 		return nil
 	}
-	sr, err := computeStrategyForSymbol(ctx, tm.watchMgr, symbol, tm.cfg)
-	if err != nil {
-		return err
+	var sr strategyResult
+	if snapshot != nil {
+		sr = *snapshot
+	} else if snap, ok := tm.getSnapshot(symbol); ok {
+		sr = snap
+	} else {
+		var err error
+		sr, err = computeStrategyForSymbol(ctx, tm.watchMgr, symbol, tm.cfg)
+		if err != nil {
+			return err
+		}
+		tm.storeSnapshot(sr)
 	}
+	tm.updateReentryReset(symbol, "LONG", sr)
+	tm.updateReentryReset(symbol, "SHORT", sr)
 	if sr.Score <= 0 {
 		return nil
 	}
@@ -1114,28 +1942,56 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 	if price <= 0 {
 		return nil
 	}
+	key := sr.Last3mBarID + "::" + sr.Last5mBarID
+	if key != "::" && !tm.shouldEvaluateSymbolKey(symbol, key) {
+		return nil
+	}
+	if !tm.evaluateEntryEnvironment(ctx, &sr) {
+		if len(sr.BlockReasons) > 0 {
+			log.Printf("%s 环境不满足开仓: %s", symbol, strings.Join(sr.BlockReasons, "; "))
+		}
+		return nil
+	}
 	var firstErr error
 	if sr.LongSignal && !tm.positions.Has(symbol, "LONG") {
+		if !tm.canEnterAfterReset(symbol, "LONG", sr) {
+			if tm.isRecentlyClosed(symbol, "LONG") {
+				sr.BlockReasons = append(sr.BlockReasons, "最近平仓冷却中")
+			}
+			goto shortCheck
+		}
 		if err := tm.openPosition(ctx, symbol, "LONG", price); err != nil {
 			log.Printf("实时开多失败 %s: %v", symbol, err)
 			tm.notifyError(ctx, fmt.Sprintf("开多失败 %s: %v", symbol, err))
 			if firstErr == nil {
 				firstErr = err
 			}
+		} else {
+			tm.clearReentryState(symbol, "LONG")
 		}
 	}
+shortCheck:
 	if tm.positions.Remaining() <= 0 {
 		return firstErr
 	}
 	if sr.ShortSignal && !tm.positions.Has(symbol, "SHORT") {
+		if !tm.canEnterAfterReset(symbol, "SHORT", sr) {
+			if tm.isRecentlyClosed(symbol, "SHORT") {
+				sr.BlockReasons = append(sr.BlockReasons, "最近平仓冷却中")
+			}
+			return firstErr
+		}
 		if err := tm.openPosition(ctx, symbol, "SHORT", price); err != nil {
 			log.Printf("实时开空失败 %s: %v", symbol, err)
 			tm.notifyError(ctx, fmt.Sprintf("开空失败 %s: %v", symbol, err))
 			if firstErr == nil {
 				firstErr = err
 			}
+		} else {
+			tm.clearReentryState(symbol, "SHORT")
 		}
 	}
+	tm.storeSnapshot(sr)
 	return firstErr
 }
 
@@ -1171,6 +2027,7 @@ func (tm *tradeManager) refreshPositions(ctx context.Context) error {
 		return err
 	}
 	tm.positions.Replace(entries)
+	tm.syncEntryTimes(entries)
 	return nil
 }
 
@@ -1219,6 +2076,7 @@ func (tm *tradeManager) CheckPositionExits(ctx context.Context) error {
 			log.Printf("获取 %s 策略数据失败: %v", symbol, err)
 			continue
 		}
+		tm.storeSnapshot(sr)
 		strategies[symbol] = sr
 	}
 
@@ -1233,29 +2091,8 @@ func (tm *tradeManager) CheckPositionExits(ctx context.Context) error {
 		if !ok {
 			continue
 		}
-		close := shouldClosePosition(side, sr)
-		tighten := shouldTightenPosition(side, sr)
-		if close {
-			err := tm.closePosition(ctx, symbol, side)
-			if err != nil {
-				log.Printf("5m 检查平仓失败 %s %s: %v", symbol, side, err)
-				tm.notifyError(ctx, fmt.Sprintf("平仓失败 %s %s: %v", symbol, side, err))
-				if firstErr == nil {
-					firstErr = err
-				}
-			} else {
-				tm.clearTightening(symbol, side)
-			}
-			continue
-		}
-		if tighten {
-			if !tm.isTightening(symbol, side) {
-				log.Printf("%s %s 触发动量预警，收紧止盈", symbol, side)
-			}
-			tm.setTightening(symbol, side)
-		} else if tm.isTightening(symbol, side) {
-			tm.clearTightening(symbol, side)
-			log.Printf("%s %s 动量恢复，解除收紧", symbol, side)
+		if err := tm.handleExitForSide(ctx, symbol, side, sr, true); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 
@@ -1279,10 +2116,13 @@ func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategy
 		tm.UpdateQuantitiesFromMetrics(ctx, metrics)
 	}
 
-	for _, sr := range strategies {
+	for i := range strategies {
+		sr := strategies[i]
 		if sr.Score <= 0 {
 			continue
 		}
+		tm.updateReentryReset(sr.Symbol, "LONG", sr)
+		tm.updateReentryReset(sr.Symbol, "SHORT", sr)
 		if tm.positions.Remaining() <= 0 {
 			break
 		}
@@ -1290,21 +2130,61 @@ func (tm *tradeManager) HandleSignals(ctx context.Context, strategies []strategy
 		if price <= 0 {
 			continue
 		}
+		key := sr.Last3mBarID + "::" + sr.Last5mBarID
+		if key != "::" && !tm.shouldEvaluateSymbolKey(sr.Symbol, key) {
+			if snap, ok := tm.getSnapshot(sr.Symbol); ok {
+				sr.EntryBlocked = snap.EntryBlocked
+				sr.BlockReasons = snap.BlockReasons
+				sr.SpreadRatio = snap.SpreadRatio
+				sr.DepthNotional = snap.DepthNotional
+			}
+			strategies[i] = sr
+			continue
+		}
+		if !tm.evaluateEntryEnvironment(ctx, &sr) {
+			strategies[i] = sr
+			if len(sr.BlockReasons) > 0 {
+				log.Printf("%s 环境不满足开仓: %s", sr.Symbol, strings.Join(sr.BlockReasons, "; "))
+			}
+			continue
+		}
+		tm.storeSnapshot(sr)
 		if sr.LongSignal && !tm.positions.Has(sr.Symbol, "LONG") {
+			if !tm.canEnterAfterReset(sr.Symbol, "LONG", sr) {
+				if tm.isRecentlyClosed(sr.Symbol, "LONG") {
+					sr.BlockReasons = append(sr.BlockReasons, "最近平仓冷却中")
+				}
+				strategies[i] = sr
+				goto shortCheckLabel
+			}
 			if err := tm.openPosition(ctx, sr.Symbol, "LONG", price); err != nil {
 				log.Printf("开多单失败 %s: %v", sr.Symbol, err)
 				tm.notifyError(ctx, fmt.Sprintf("开多失败 %s: %v", sr.Symbol, err))
+			} else {
+				tm.clearReentryState(sr.Symbol, "LONG")
 			}
 		}
+	shortCheckLabel:
 		if tm.positions.Remaining() <= 0 {
+			strategies[i] = sr
 			break
 		}
 		if sr.ShortSignal && !tm.positions.Has(sr.Symbol, "SHORT") {
+			if !tm.canEnterAfterReset(sr.Symbol, "SHORT", sr) {
+				if tm.isRecentlyClosed(sr.Symbol, "SHORT") {
+					sr.BlockReasons = append(sr.BlockReasons, "最近平仓冷却中")
+				}
+				strategies[i] = sr
+				continue
+			}
 			if err := tm.openPosition(ctx, sr.Symbol, "SHORT", price); err != nil {
 				log.Printf("开空单失败 %s: %v", sr.Symbol, err)
 				tm.notifyError(ctx, fmt.Sprintf("开空失败 %s: %v", sr.Symbol, err))
+			} else {
+				tm.clearReentryState(sr.Symbol, "SHORT")
 			}
 		}
+		strategies[i] = sr
 	}
 }
 
@@ -1340,6 +2220,7 @@ func (tm *tradeManager) openPosition(ctx context.Context, symbol, side string, p
 		log.Printf("刷新持仓失败: %v", err)
 		tm.positions.Set(symbol, side, qty)
 	}
+	tm.setEntryTime(symbol, side, time.Now())
 	log.Printf("%s %s 开仓成功，数量 %s", symbol, side, formatQuantity(qty))
 	return nil
 }
@@ -1496,6 +2377,7 @@ func (tm *tradeManager) closePosition(ctx context.Context, symbol, side string) 
 		log.Printf("刷新持仓失败: %v", err)
 		tm.positions.Remove(symbol, side)
 	}
+	tm.clearEntryTime(symbol, side)
 	log.Printf("%s %s 平仓成功，数量 %s", symbol, side, formatQuantity(adjQty))
 	return nil
 }
@@ -2156,12 +3038,21 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 	if len(watchSymbols) > 0 {
 		b.WriteString(fmt.Sprintf("当前监听币种(%d): %s\n", len(watchSymbols), strings.Join(watchSymbols, ", ")))
 	}
-	b.WriteString("信号列表 (仅展示满足开仓条件的标的)：\n")
+	b.WriteString("信号列表 (含环境过滤信息)：\n")
 	printed := false
 	for _, sr := range strategies {
+		if !sr.LongSignal && !sr.ShortSignal {
+			continue
+		}
+		status := ""
+		if sr.EntryBlocked && len(sr.BlockReasons) > 0 {
+			status = " BLOCK: " + strings.Join(sr.BlockReasons, "; ")
+		}
+		spreadInfo := fmt.Sprintf(" Spread/ATR:%0.3f Depth:%0.0f", sr.SpreadRatio, sr.DepthNotional)
+		qtyInfo := formatQtyInfo(qtyMap, sr.Symbol)
 		if sr.LongSignal {
 			printed = true
-			b.WriteString(fmt.Sprintf("[开多] %-10s Score:%0.2f 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s\n",
+			b.WriteString(fmt.Sprintf("[开多] %-10s Score:%0.2f 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s%s%s\n",
 				sr.Symbol,
 				sr.Score,
 				sr.Metrics.Change30m,
@@ -2169,12 +3060,14 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 				sr.Metrics.AvgAmplitude,
 				summarizeTimeframe(sr.FiveMinute),
 				summarizeTimeframe(sr.ThreeMinute),
-				formatQtyInfo(qtyMap, sr.Symbol),
+				spreadInfo,
+				qtyInfo,
+				status,
 			))
 		}
 		if sr.ShortSignal {
 			printed = true
-			b.WriteString(fmt.Sprintf("[开空] %-10s Score:%0.2f 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s\n",
+			b.WriteString(fmt.Sprintf("[开空] %-10s Score:%0.2f 30m:%+0.4f%% 10m:%+0.4f%% Avg振幅:%0.4f%% | %s | %s%s%s%s\n",
 				sr.Symbol,
 				sr.Score,
 				sr.Metrics.Change30m,
@@ -2182,7 +3075,9 @@ func buildTelegramMessage(now time.Time, volumeCount int, top int, gainers, lose
 				sr.Metrics.AvgAmplitude,
 				summarizeTimeframe(sr.FiveMinute),
 				summarizeTimeframe(sr.ThreeMinute),
-				formatQtyInfo(qtyMap, sr.Symbol),
+				spreadInfo,
+				qtyInfo,
+				status,
 			))
 		}
 	}
@@ -2239,17 +3134,22 @@ func buildSignalAlerts(strategies []strategyResult, qtyMap map[string]float64) s
 	}
 	var lines []string
 	for _, sr := range strategies {
+		if sr.EntryBlocked {
+			continue
+		}
 		if !sr.LongSignal && !sr.ShortSignal {
 			continue
 		}
 		qtyInfo := formatQtyInfo(qtyMap, sr.Symbol)
 		if sr.LongSignal {
-			lines = append(lines, fmt.Sprintf("[开多] %s%s Score:%0.2f 30m:%+.4f%% 10m:%+.4f%% 5m MACD_H:%+.4f ADX:%.2f | 3m MACD_H:%+.4f ADX:%.2f",
+			lines = append(lines, fmt.Sprintf("[开多] %s%s Score:%0.2f 30m:%+.4f%% 10m:%+.4f%% Spread/ATR:%0.3f Depth:%0.0f 5m MACD_H:%+.4f ADX:%.2f | 3m MACD_H:%+.4f ADX:%.2f",
 				sr.Symbol,
 				qtyInfo,
 				sr.Score,
 				sr.Metrics.Change30m,
 				sr.Metrics.Change10m,
+				sr.SpreadRatio,
+				sr.DepthNotional,
 				sr.FiveMinute.MACDHist,
 				sr.FiveMinute.ADX,
 				sr.ThreeMinute.MACDHist,
@@ -2257,12 +3157,14 @@ func buildSignalAlerts(strategies []strategyResult, qtyMap map[string]float64) s
 			))
 		}
 		if sr.ShortSignal {
-			lines = append(lines, fmt.Sprintf("[开空] %s%s Score:%0.2f 30m:%+.4f%% 10m:%+.4f%% 5m MACD_H:%+.4f ADX:%.2f | 3m MACD_H:%+.4f ADX:%.2f",
+			lines = append(lines, fmt.Sprintf("[开空] %s%s Score:%0.2f 30m:%+.4f%% 10m:%+.4f%% Spread/ATR:%0.3f Depth:%0.0f 5m MACD_H:%+.4f ADX:%.2f | 3m MACD_H:%+.4f ADX:%.2f",
 				sr.Symbol,
 				qtyInfo,
 				sr.Score,
 				sr.Metrics.Change30m,
 				sr.Metrics.Change10m,
+				sr.SpreadRatio,
+				sr.DepthNotional,
 				sr.FiveMinute.MACDHist,
 				sr.FiveMinute.ADX,
 				sr.ThreeMinute.MACDHist,
@@ -2444,6 +3346,10 @@ func computeTimeframeAnalysis(interval string, candles []candle, cfg config) (ti
 		signalPrevPrev := macdSignalSeries[lastIdx-2]
 		macdHistPrevPrev = macdPrevPrevLine - signalPrevPrev
 	}
+	macdHistSeries := make([]float64, len(macdSignalSeries))
+	for i := range macdHistSeries {
+		macdHistSeries[i] = macdLine[i] - macdSignalSeries[i]
+	}
 
 	adxVal, err := computeADX(clean, cfg.adxPeriod)
 	if err != nil {
@@ -2480,6 +3386,48 @@ func computeTimeframeAnalysis(interval string, candles []candle, cfg config) (ti
 	analysis.ADXPrev = adxPrev
 	analysis.ADXPrev2 = adxPrev2
 	analysis.ADXPrev3 = adxPrev3
+	analysis.MACDStd200 = stddevLastN(macdHistSeries, 200)
+	analysis.MACDEpsilon = analysis.MACDStd200 * macdStdMultiplier
+	if atrSeries, err := computeATRSeries(clean, 50); err == nil && len(atrSeries) > 0 {
+		analysis.ATR50 = atrSeries[len(atrSeries)-1]
+	}
+	if analysis.ATR50 > 0 {
+		analysis.Sep = (analysis.EMAFast - analysis.EMASlow) / analysis.ATR50
+	}
+	if atr22, err := computeATRSeries(clean, 22); err == nil && len(atr22) > 0 {
+		analysis.ATR22 = atr22[len(atr22)-1]
+	}
+	if len(clean) >= 22 {
+		window := clean[len(clean)-22:]
+		high := window[0].High
+		low := window[0].Low
+		for _, c := range window {
+			if c.High > high {
+				high = c.High
+			}
+			if c.Low < low {
+				low = c.Low
+			}
+		}
+		analysis.HighestHigh22 = high
+		analysis.LowestLow22 = low
+	} else if len(clean) > 0 {
+		high := clean[0].High
+		low := clean[0].Low
+		for _, c := range clean {
+			if c.High > high {
+				high = c.High
+			}
+			if c.Low < low {
+				low = c.Low
+			}
+		}
+		analysis.HighestHigh22 = high
+		analysis.LowestLow22 = low
+	}
+	if chop, err := computeChoppiness(clean, 14); err == nil {
+		analysis.Choppiness = chop
+	}
 	analysis.LongSignal = false
 	analysis.ShortSignal = false
 	return analysis, nil
@@ -2544,6 +3492,11 @@ func computeStrategyFromCandles(symbol string, candles3m, candles5m []candle, cf
 	}
 	result.Metrics = metrics
 
+	last3 := clean3[len(clean3)-1]
+	last5 := clean5[len(clean5)-1]
+	result.Last3mBarID = fmt.Sprintf("%d", last3.CloseTime.UnixNano())
+	result.Last5mBarID = fmt.Sprintf("%d", last5.CloseTime.UnixNano())
+
 	threeMinute, err := computeTimeframeAnalysis("3m", clean3, cfg)
 	if err != nil {
 		return result, err
@@ -2565,12 +3518,15 @@ func computeStrategyFromCandles(symbol string, candles3m, candles5m []candle, cf
 	}
 	adxDelta3 := fiveMinute.ADX - fiveMinute.ADXPrev3
 	adxRising := fiveMinute.ADX >= adxThreshold && adxDelta3 > 0
+	enterSep := sepEnterThreshold
+	sep := fiveMinute.Sep
 
-	longDirection := fiveMinute.EMAFast > fiveMinute.EMASlow && emaDiffLong > cfg.emaDiffThreshold && adxRising
-	shortDirection := fiveMinute.EMAFast < fiveMinute.EMASlow && emaDiffShort > cfg.emaDiffThreshold && adxRising
+	longDirection := adxRising && sep >= enterSep && emaDiffLong > cfg.emaDiffThreshold
+	shortDirection := adxRising && sep <= -enterSep && emaDiffShort > cfg.emaDiffThreshold
 
-	macdCrossLong := threeMinute.MACDHist > 0 && threeMinute.MACDPrev <= 0
-	macdCrossShort := threeMinute.MACDHist < 0 && threeMinute.MACDPrev >= 0
+	epsilon := threeMinute.MACDEpsilon
+	macdCrossLong := threeMinute.MACDHist > epsilon && threeMinute.MACDPrev <= epsilon
+	macdCrossShort := threeMinute.MACDHist < -epsilon && threeMinute.MACDPrev >= -epsilon
 
 	emaBounceLong := false
 	emaBounceShort := false
@@ -2581,19 +3537,19 @@ func computeStrategyFromCandles(symbol string, candles3m, candles5m []candle, cf
 		emaBounceShort = prev.Close >= threeMinute.EMAFast && last.Close < threeMinute.EMAFast
 	}
 
-	timingLong := macdCrossLong || emaBounceLong
-	timingShort := macdCrossShort || emaBounceShort
+	timingLong := (macdCrossLong || emaBounceLong) && threeMinute.MACDHist > epsilon
+	timingShort := (macdCrossShort || emaBounceShort) && threeMinute.MACDHist < -epsilon
 
 	result.LongSignal = longDirection && timingLong
 	result.ShortSignal = shortDirection && timingShort
 
 	result.Score = 0
 	if result.LongSignal {
-		diffScore := emaDiffLong - cfg.emaDiffThreshold
-		if diffScore < 0 {
-			diffScore = 0
+		sepScore := sep - enterSep
+		if sepScore < 0 {
+			sepScore = 0
 		}
-		adxScore := fiveMinute.ADX - cfg.adxDirectionThreshold
+		adxScore := fiveMinute.ADX - adxThreshold
 		if adxScore < 0 {
 			adxScore = 0
 		}
@@ -2604,13 +3560,13 @@ func computeStrategyFromCandles(symbol string, candles3m, candles5m []candle, cf
 		if emaBounceLong {
 			crossScore += math.Abs(clean3[len(clean3)-1].Close - threeMinute.EMAFast)
 		}
-		result.Score = diffScore + adxScore + crossScore
+		result.Score = sepScore + adxScore + crossScore
 	} else if result.ShortSignal {
-		diffScore := emaDiffShort - cfg.emaDiffThreshold
-		if diffScore < 0 {
-			diffScore = 0
+		sepScore := (-enterSep) - sep
+		if sepScore < 0 {
+			sepScore = 0
 		}
-		adxScore := fiveMinute.ADX - cfg.adxDirectionThreshold
+		adxScore := fiveMinute.ADX - adxThreshold
 		if adxScore < 0 {
 			adxScore = 0
 		}
@@ -2621,7 +3577,7 @@ func computeStrategyFromCandles(symbol string, candles3m, candles5m []candle, cf
 		if emaBounceShort {
 			crossScore += math.Abs(clean3[len(clean3)-1].Close - threeMinute.EMAFast)
 		}
-		result.Score = diffScore + adxScore + crossScore
+		result.Score = sepScore + adxScore + crossScore
 	}
 
 	return result, nil
@@ -2753,6 +3709,94 @@ func emaSeries(values []float64, period int) []float64 {
 		ema[i] = ema[period-1]
 	}
 	return ema
+}
+
+func stddevLastN(values []float64, window int) float64 {
+	if window <= 1 || len(values) < 2 {
+		return 0
+	}
+	if len(values) < window {
+		window = len(values)
+	}
+	segment := values[len(values)-window:]
+	sum := 0.0
+	for _, v := range segment {
+		sum += v
+	}
+	mean := sum / float64(window)
+	variance := 0.0
+	for _, v := range segment {
+		diff := v - mean
+		variance += diff * diff
+	}
+	variance /= float64(window)
+	return math.Sqrt(variance)
+}
+
+func computeATRSeries(candles []candle, period int) ([]float64, error) {
+	if period <= 0 {
+		return nil, errors.New("ATR 周期需大于0")
+	}
+	if len(candles) < period {
+		return nil, errors.New("K线数据不足以计算 ATR")
+	}
+	tr := make([]float64, len(candles))
+	for i := range candles {
+		if i == 0 {
+			tr[i] = candles[i].High - candles[i].Low
+			continue
+		}
+		highLow := candles[i].High - candles[i].Low
+		highPrevClose := math.Abs(candles[i].High - candles[i-1].Close)
+		lowPrevClose := math.Abs(candles[i].Low - candles[i-1].Close)
+		tr[i] = math.Max(highLow, math.Max(highPrevClose, lowPrevClose))
+	}
+	atr := make([]float64, len(candles))
+	sum := 0.0
+	for i := 0; i < period && i < len(tr); i++ {
+		sum += tr[i]
+	}
+	atr[period-1] = sum / float64(period)
+	for i := period; i < len(tr); i++ {
+		atr[i] = (atr[i-1]*(float64(period-1)) + tr[i]) / float64(period)
+	}
+	for i := 0; i < period-1 && i < len(atr); i++ {
+		atr[i] = atr[period-1]
+	}
+	return atr, nil
+}
+
+func computeChoppiness(candles []candle, period int) (float64, error) {
+	if period <= 0 {
+		return 0, errors.New("Choppiness 周期需大于0")
+	}
+	if len(candles) < period+1 {
+		return 0, errors.New("K线数据不足以计算 Choppiness")
+	}
+	sumTR := 0.0
+	highestHigh := candles[len(candles)-period].High
+	lowestLow := candles[len(candles)-period].Low
+	for i := len(candles) - period; i < len(candles); i++ {
+		c := candles[i]
+		prevClose := candles[i-1].Close
+		highLow := c.High - c.Low
+		highClose := math.Abs(c.High - prevClose)
+		lowClose := math.Abs(c.Low - prevClose)
+		tr := math.Max(highLow, math.Max(highClose, lowClose))
+		sumTR += tr
+		if c.High > highestHigh {
+			highestHigh = c.High
+		}
+		if c.Low < lowestLow {
+			lowestLow = c.Low
+		}
+	}
+	rangeSize := highestHigh - lowestLow
+	if rangeSize <= 0 || sumTR <= 0 {
+		return 0, errors.New("无法计算 Choppiness")
+	}
+	chop := math.Log10(sumTR/rangeSize) / math.Log10(float64(period))
+	return chop * 100, nil
 }
 
 func computeADX(candles []candle, period int) (float64, error) {
