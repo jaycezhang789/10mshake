@@ -1931,6 +1931,47 @@ func (tm *tradeManager) holdingReasons(symbol, side string, sr strategyResult, c
 	return strings.Join(reasons, "；")
 }
 
+func summarizeEntrySignals(sr strategyResult, cfg config) (longChecks []string, shortChecks []string) {
+	epsilon := sr.ThreeMinute.MACDEpsilon
+	if epsilon < 0 {
+		epsilon = 0
+	}
+	adxThreshold := cfg.adxDirectionThreshold
+	if adxThreshold < 22 {
+		adxThreshold = 22
+	}
+	sep := sr.FiveMinute.Sep
+	adxDelta3 := sr.FiveMinute.ADX - sr.FiveMinute.ADXPrev3
+	emaDiffLong := sr.FiveMinute.EMAFast - sr.FiveMinute.EMASlow
+	emaDiffShort := sr.FiveMinute.EMASlow - sr.FiveMinute.EMAFast
+	macdDelta := sr.ThreeMinute.MACDHist - sr.ThreeMinute.MACDPrev
+
+	longChecks = append(longChecks,
+		fmt.Sprintf("%s 5m Sep %.3f ≥ %.2f", statusMark(sep >= sepEnterThreshold), sep, sepEnterThreshold),
+		fmt.Sprintf("%s 5m EMA差 %.6f > %.6f", statusMark(emaDiffLong > cfg.emaDiffThreshold), emaDiffLong, cfg.emaDiffThreshold),
+		fmt.Sprintf("%s 5m ADX %.2f ≥ %.2f", statusMark(sr.FiveMinute.ADX >= adxThreshold), sr.FiveMinute.ADX, adxThreshold),
+		fmt.Sprintf("%s 5m ADXΔ3 %.6f > 0", statusMark(adxDelta3 > 0), adxDelta3),
+		fmt.Sprintf("%s 3m MACDHist %.6f > ε %.6f", statusMark(sr.ThreeMinute.MACDHist > epsilon), sr.ThreeMinute.MACDHist, epsilon),
+		fmt.Sprintf("%s 3m MACD 穿越 ε (Prev %.6f)", statusMark(sr.ThreeMinute.MACDPrev <= epsilon && sr.ThreeMinute.MACDHist > epsilon), sr.ThreeMinute.MACDPrev),
+		fmt.Sprintf("%s 3m MACD 动量 Δ %.6f > 0", statusMark(macdDelta > 0), macdDelta),
+		fmt.Sprintf("%s 3m EMAfastSlope %.6f > 0", statusMark(sr.ThreeMinute.EMAFastSlope > 0), sr.ThreeMinute.EMAFastSlope),
+		fmt.Sprintf("%s 3m EMAslowSlope %.6f > 0", statusMark(sr.ThreeMinute.EMASlowSlope > 0), sr.ThreeMinute.EMASlowSlope),
+	)
+
+	shortChecks = append(shortChecks,
+		fmt.Sprintf("%s 5m Sep %.3f ≤ %.2f", statusMark(sep <= -sepEnterThreshold), sep, -sepEnterThreshold),
+		fmt.Sprintf("%s 5m EMA差 %.6f > %.6f", statusMark(emaDiffShort > cfg.emaDiffThreshold), emaDiffShort, cfg.emaDiffThreshold),
+		fmt.Sprintf("%s 5m ADX %.2f ≥ %.2f", statusMark(sr.FiveMinute.ADX >= adxThreshold), sr.FiveMinute.ADX, adxThreshold),
+		fmt.Sprintf("%s 5m ADXΔ3 %.6f > 0", statusMark(adxDelta3 > 0), adxDelta3),
+		fmt.Sprintf("%s 3m MACDHist %.6f < -ε %.6f", statusMark(sr.ThreeMinute.MACDHist < -epsilon), sr.ThreeMinute.MACDHist, epsilon),
+		fmt.Sprintf("%s 3m MACD 穿越 -ε (Prev %.6f)", statusMark(sr.ThreeMinute.MACDPrev >= -epsilon && sr.ThreeMinute.MACDHist < -epsilon), sr.ThreeMinute.MACDPrev),
+		fmt.Sprintf("%s 3m MACD 动量 Δ %.6f < 0", statusMark(macdDelta < 0), macdDelta),
+		fmt.Sprintf("%s 3m EMAfastSlope %.6f < 0", statusMark(sr.ThreeMinute.EMAFastSlope < 0), sr.ThreeMinute.EMAFastSlope),
+		fmt.Sprintf("%s 3m EMAslowSlope %.6f < 0", statusMark(sr.ThreeMinute.EMASlowSlope < 0), sr.ThreeMinute.EMASlowSlope),
+	)
+	return
+}
+
 func (tm *tradeManager) startCooldown(symbol string) {
 	tm.cooldownMu.Lock()
 	if tm.cooldown == nil {
@@ -2301,8 +2342,14 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 	}
 	tm.updateReentryReset(symbol, "LONG", sr)
 	tm.updateReentryReset(symbol, "SHORT", sr)
+	longChecks, shortChecks := summarizeEntrySignals(sr, tm.cfg)
 	if sr.Score <= 0 {
-		logDecision("跳过", []string{fmt.Sprintf("策略得分 %.4f <= 0", sr.Score)})
+		reasons := []string{
+			fmt.Sprintf("策略得分 %.4f <= 0", sr.Score),
+			"多头条件：" + strings.Join(longChecks, "； "),
+			"空头条件：" + strings.Join(shortChecks, "； "),
+		}
+		logDecision("跳过", reasons)
 		return nil
 	}
 	price := sr.Metrics.Last
@@ -2312,7 +2359,7 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 	}
 	key := sr.Last3mBarID + "::" + sr.Last5mBarID
 	if key != "::" && !tm.shouldEvaluateSymbolKey(symbol, key) {
-		logDecision("跳过", []string{"已评估过最近 K 线快照"})
+		logDecision("跳过", []string{"已评估过最近 K 线快照", "多头条件：" + strings.Join(longChecks, "； "), "空头条件：" + strings.Join(shortChecks, "； ")})
 		return nil
 	}
 	if !tm.evaluateEntryEnvironment(ctx, &sr) {
@@ -2320,6 +2367,10 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 		if len(sr.BlockReasons) > 0 {
 			reasons = append(reasons, sr.BlockReasons...)
 		}
+		reasons = append(reasons,
+			"多头条件："+strings.Join(longChecks, "； "),
+			"空头条件："+strings.Join(shortChecks, "； "),
+		)
 		logDecision("跳过", reasons)
 		return nil
 	}
@@ -2391,6 +2442,9 @@ func (tm *tradeManager) evaluateOpenForSymbol(ctx context.Context, symbol string
 	}
 
 	tm.storeSnapshot(sr)
+
+	longReasons = append(longReasons, "条件回顾："+strings.Join(longChecks, "； "))
+	shortReasons = append(shortReasons, "条件回顾："+strings.Join(shortChecks, "； "))
 
 	summary := []string{}
 	if openedLong {
