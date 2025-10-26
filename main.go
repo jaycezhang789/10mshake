@@ -1779,6 +1779,158 @@ func shouldBaselineExit(side string, sr strategyResult) bool {
 	}
 }
 
+func statusMark(ok bool) string {
+	if ok {
+		return "✅"
+	}
+	return "❌"
+}
+
+func formatStatus(ok bool, msg string) string {
+	if ok {
+		return "✅ " + msg
+	}
+	return "❌ " + msg
+}
+
+func (tm *tradeManager) describeChandelier(symbol, side string, sr strategyResult) (bool, string) {
+	if !tm.isTightening(symbol, side) {
+		return false, "未处于收紧"
+	}
+	ts, ok := tm.getTrailing(symbol, side)
+	if !ok || ts.CE == 0 {
+		return false, "吊灯线尚未建立"
+	}
+	price := sr.Metrics.Last
+	switch strings.ToUpper(side) {
+	case "LONG":
+		return price <= ts.CE, fmt.Sprintf("价格 %.6f / CE %.6f", price, ts.CE)
+	case "SHORT":
+		return price >= ts.CE, fmt.Sprintf("价格 %.6f / CE %.6f", price, ts.CE)
+	default:
+		return false, "未知方向"
+	}
+}
+
+func (tm *tradeManager) describeConfirmExit(symbol, side string, sr strategyResult) (bool, []string) {
+	if !tm.isTightening(symbol, side) {
+		return false, []string{"未处于收紧"}
+	}
+	ts, ok := tm.getTrailing(symbol, side)
+	if !ok {
+		return false, []string{"吊灯线尚未建立"}
+	}
+	atr := sr.ThreeMinute.ATR22
+	if atr <= 0 {
+		atr = sr.ThreeMinute.ATR50
+	}
+	if atr <= 0 {
+		return false, []string{"ATR 未就绪"}
+	}
+	price := sr.Metrics.Last
+	initialRisk := ts.InitialRisk
+	if initialRisk <= 0 {
+		initialRisk = atr
+	}
+	if initialRisk <= 0 {
+		initialRisk = math.Abs(price) * 1e-4
+	}
+	var details []string
+	var triggered bool
+	atrDrawdown := 1.8 * atr
+	profitDrawdown := 0.8 * initialRisk
+	switch strings.ToUpper(side) {
+	case "LONG":
+		drawdown := ts.Peak - price
+		if drawdown < 0 {
+			drawdown = 0
+		}
+		condATR := drawdown >= atrDrawdown
+		condProfit := drawdown >= profitDrawdown
+		condSep := sr.FiveMinute.Sep <= sepExitThreshold
+		details = append(details,
+			formatStatus(condATR, fmt.Sprintf("回撤 %.6f >= 1.8×ATR22 %.6f", drawdown, atrDrawdown)),
+			formatStatus(condProfit, fmt.Sprintf("利润回吐 %.6f >= 0.8R %.6f", drawdown, profitDrawdown)),
+			formatStatus(condSep, fmt.Sprintf("5m Sep %.3f <= %.2f", sr.FiveMinute.Sep, sepExitThreshold)),
+		)
+		triggered = condATR || condProfit || condSep
+	case "SHORT":
+		drawdown := price - ts.Peak
+		if drawdown < 0 {
+			drawdown = 0
+		}
+		condATR := drawdown >= atrDrawdown
+		condProfit := drawdown >= profitDrawdown
+		condSep := sr.FiveMinute.Sep >= -sepExitThreshold
+		details = append(details,
+			formatStatus(condATR, fmt.Sprintf("回撤 %.6f >= 1.8×ATR22 %.6f", drawdown, atrDrawdown)),
+			formatStatus(condProfit, fmt.Sprintf("利润回吐 %.6f >= 0.8R %.6f", drawdown, profitDrawdown)),
+			formatStatus(condSep, fmt.Sprintf("5m Sep %.3f >= %.2f", sr.FiveMinute.Sep, -sepExitThreshold)),
+		)
+		triggered = condATR || condProfit || condSep
+	default:
+		return false, []string{"未知方向"}
+	}
+	return triggered, details
+}
+
+func describeBaselineExitStatus(side string, sr strategyResult) (bool, []string) {
+	epsilon := sr.ThreeMinute.MACDEpsilon
+	if epsilon < 0 {
+		epsilon = 0
+	}
+	exitSep := sepExitThreshold
+	switch strings.ToUpper(side) {
+	case "LONG":
+		histExit := sr.ThreeMinute.MACDHist < -epsilon
+		sepExit := sr.FiveMinute.Sep <= exitSep && sr.FiveMinute.EMAFastSlope <= 0
+		return histExit || sepExit, []string{
+			formatStatus(histExit, fmt.Sprintf("3m MACD Hist %.6f < -ε %.6f", sr.ThreeMinute.MACDHist, epsilon)),
+			formatStatus(sepExit, fmt.Sprintf("5m Sep %.3f <= %.2f 且 EMAfastSlope %.6f <= 0", sr.FiveMinute.Sep, exitSep, sr.FiveMinute.EMAFastSlope)),
+		}
+	case "SHORT":
+		histExit := sr.ThreeMinute.MACDHist > epsilon
+		sepExit := sr.FiveMinute.Sep >= -exitSep && sr.FiveMinute.EMAFastSlope >= 0
+		return histExit || sepExit, []string{
+			formatStatus(histExit, fmt.Sprintf("3m MACD Hist %.6f > ε %.6f", sr.ThreeMinute.MACDHist, epsilon)),
+			formatStatus(sepExit, fmt.Sprintf("5m Sep %.3f >= %.2f 且 EMAfastSlope %.6f >= 0", sr.FiveMinute.Sep, -exitSep, sr.FiveMinute.EMAFastSlope)),
+		}
+	default:
+		return false, []string{"未知方向"}
+	}
+}
+
+func (tm *tradeManager) holdingReasons(symbol, side string, sr strategyResult, chandelier bool, confirm bool, baseline bool, tightenCandidate bool, canSoft bool) string {
+	var reasons []string
+	if chandelier {
+		reasons = append(reasons, "吊灯条件满足，将执行硬退出")
+	} else if tm.isTightening(symbol, side) {
+		reasons = append(reasons, "已收紧，等待吊灯或确认退出触发")
+	} else if tightenCandidate {
+		reasons = append(reasons, "动量减弱，准备进入收紧阶段")
+	} else {
+		reasons = append(reasons, "趋势信号仍满足持仓条件")
+	}
+	if confirm {
+		if canSoft {
+			reasons = append(reasons, "确认退出条件满足，将执行软退出")
+		} else {
+			reasons = append(reasons, "确认退出满足，但最小持仓时间未到")
+		}
+	}
+	if baseline {
+		if canSoft {
+			reasons = append(reasons, "基线退出条件满足，将执行软退出")
+		} else {
+			reasons = append(reasons, "基线退出满足，但最小持仓时间未到")
+		}
+	}
+	if !canSoft {
+		reasons = append(reasons, fmt.Sprintf("最小持仓时间要求 %dm 未满足", int(minHoldDuration/time.Minute)))
+	}
+	return strings.Join(reasons, "；")
+}
+
 func (tm *tradeManager) startCooldown(symbol string) {
 	tm.cooldownMu.Lock()
 	if tm.cooldown == nil {
@@ -3042,6 +3194,62 @@ func run(cfg config) error {
 			}
 		}
 		log.Printf("已更新持仓快照，持仓数: %d", len(entries))
+		if tradeMgr.cfg.telegramToken != "" && tradeMgr.cfg.telegramChatID != "" {
+			var b strings.Builder
+			timestamp := time.Now().Format("2006-01-02 15:04:05")
+			b.WriteString(fmt.Sprintf("📊 持仓巡检 %s\n", timestamp))
+			if len(entries) == 0 {
+				b.WriteString("当前无持仓")
+			} else {
+				sorted := append([]positionEntry(nil), entries...)
+				sort.Slice(sorted, func(i, j int) bool {
+					si := strings.ToUpper(sorted[i].Symbol)
+					sj := strings.ToUpper(sorted[j].Symbol)
+					if si == sj {
+						return sorted[i].Side < sorted[j].Side
+					}
+					return si < sj
+				})
+				for idx, entry := range sorted {
+					symbol := strings.ToUpper(entry.Symbol)
+					side := strings.ToUpper(entry.Side)
+					qtyText := formatQuantity(entry.Qty)
+					sr, ok := strategyMap[symbol]
+					rank := tradeMgr.getVolumeRank(symbol)
+					rankText := "未知"
+					if rank > 0 {
+						rankText = fmt.Sprintf("#%d", rank)
+					}
+					b.WriteString(fmt.Sprintf("%d) %s %s Qty:%s 价格:%.6f (成交量:%s)\n", idx+1, symbol, side, qtyText, sr.Metrics.Last, rankText))
+					if !ok {
+						b.WriteString("   指标数据暂缺，等待下一根 K 线\n")
+						continue
+					}
+					three := sr.ThreeMinute
+					five := sr.FiveMinute
+					b.WriteString(fmt.Sprintf("   3m MACD %.6f (prev %.6f/%.6f, ε %.6f) | EMAfast %.6f slope %.6f | EMAslow slope %.6f\n",
+						three.MACDHist, three.MACDPrev, three.MACDPrevPrev, three.MACDEpsilon, three.EMAFast, three.EMAFastSlope, three.EMASlowSlope))
+					b.WriteString(fmt.Sprintf("   5m Sep %.3f (入阈 %.2f 出阈 %.2f) | ADX %.2f (Δ3 %.2f) | ATR22 %.6f ATR50 %.6f\n",
+						five.Sep, sepEnterThreshold, sepExitThreshold, five.ADX, five.ADX-five.ADXPrev3, three.ATR22, three.ATR50))
+					tightening := tradeMgr.isTightening(symbol, side)
+					tightenCandidate := shouldTightenPosition(side, sr)
+					chandelier, chandelierDetail := tradeMgr.describeChandelier(symbol, side, sr)
+					confirm, confirmDetails := tradeMgr.describeConfirmExit(symbol, side, sr)
+					baseline, baselineDetails := describeBaselineExitStatus(side, sr)
+					canSoft := tradeMgr.canSoftExit(symbol, side)
+					ts, hasTrailing := tradeMgr.getTrailing(symbol, side)
+					if hasTrailing {
+						b.WriteString(fmt.Sprintf("   吊灯线 CE %.6f Peak %.6f Mult %.2f\n", ts.CE, ts.Peak, ts.Multiplier))
+					}
+					b.WriteString(fmt.Sprintf("   收紧:%s 候选:%s 吊灯:%s (%s)\n",
+						statusMark(tightening), statusMark(tightenCandidate), statusMark(chandelier), chandelierDetail))
+					b.WriteString(fmt.Sprintf("   确认:%s (%s)\n", statusMark(confirm), strings.Join(confirmDetails, "； ")))
+					b.WriteString(fmt.Sprintf("   基线:%s (%s)\n", statusMark(baseline), strings.Join(baselineDetails, "； ")))
+					b.WriteString(fmt.Sprintf("   继续持仓原因: %s\n", tradeMgr.holdingReasons(symbol, side, sr, chandelier, confirm, baseline, tightenCandidate, canSoft)))
+				}
+			}
+			tradeMgr.sendTelegram(ctxStatus, b.String())
+		}
 		return nil
 	}
 
@@ -3057,7 +3265,7 @@ func run(cfg config) error {
 	defer volumeTicker.Stop()
 	updateTicker := time.NewTicker(cfg.updateInterval)
 	defer updateTicker.Stop()
-	positionTicker := time.NewTicker(6 * time.Minute)
+	positionTicker := time.NewTicker(5 * time.Minute)
 	defer positionTicker.Stop()
 
 	log.Printf("启动完成：成交量刷新周期 %s，指标评估周期 %s", cfg.volumeRefresh, cfg.updateInterval)
