@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -138,14 +139,32 @@ type intervalWatcher struct {
 	duration time.Duration
 	mu       sync.RWMutex
 	candles  []candle
-	cancel   context.CancelFunc
-	done     chan struct{}
 	onCandle func(string, string)
+}
+
+type intervalHub struct {
+	interval    string
+	mgr         *symbolManager
+	ctx         context.Context
+	cancel      context.CancelFunc
+	subscribe   chan string
+	unsubscribe chan string
+	connMu      sync.Mutex
+	conn        *websocket.Conn
+	commandMu   sync.Mutex
+	nextID      int64
+}
+
+type combinedStreamEvent struct {
+	Stream string       `json:"stream"`
+	Data   wsKlineEvent `json:"data"`
 }
 
 type symbolManager struct {
 	mu       sync.RWMutex
 	watchers map[string]map[string]*intervalWatcher
+	hubMu    sync.RWMutex
+	hubs     map[string]*intervalHub
 	client   *http.Client
 	cfg      config
 	onCandle func(string, string)
@@ -225,12 +244,17 @@ func newSymbolManager(client *http.Client, cfg config) *symbolManager {
 	for _, iv := range intervalConfigs {
 		watchers[iv.Name] = make(map[string]*intervalWatcher)
 	}
-	return &symbolManager{
+	mgr := &symbolManager{
 		watchers: watchers,
+		hubs:     make(map[string]*intervalHub),
 		client:   client,
 		cfg:      cfg,
 		onCandle: nil,
 	}
+	for _, iv := range intervalConfigs {
+		mgr.hubs[strings.ToLower(iv.Name)] = newIntervalHub(mgr, iv.Name)
+	}
+	return mgr
 }
 
 func dedupeCandles(candles []candle) []candle {
@@ -264,7 +288,6 @@ func newIntervalWatcher(symbol, interval string, duration time.Duration, candles
 		interval: strings.ToLower(interval),
 		duration: duration,
 		candles:  copyCandles,
-		done:     make(chan struct{}),
 		onCandle: handler,
 	}
 }
@@ -275,71 +298,216 @@ func (w *intervalWatcher) setHandler(handler func(string, string)) {
 	w.mu.Unlock()
 }
 
-func (w *intervalWatcher) start(ctx context.Context) {
-	childCtx, cancel := context.WithCancel(ctx)
-	w.cancel = cancel
-	go w.run(childCtx)
+func newIntervalHub(mgr *symbolManager, interval string) *intervalHub {
+	ctx, cancel := context.WithCancel(context.Background())
+	hub := &intervalHub{
+		interval:    strings.ToLower(interval),
+		mgr:         mgr,
+		ctx:         ctx,
+		cancel:      cancel,
+		subscribe:   make(chan string, 512),
+		unsubscribe: make(chan string, 512),
+	}
+	go hub.run()
+	return hub
 }
 
-func (w *intervalWatcher) run(ctx context.Context) {
-	defer close(w.done)
+func (h *intervalHub) run() {
 	backoff := time.Second
 	for {
-		if ctx.Err() != nil {
+		if h.ctx.Err() != nil {
 			return
 		}
-		err := w.connect(ctx)
-		if err == nil {
-			return
+		conn, _, err := websocket.DefaultDialer.DialContext(h.ctx, wsBaseURL+"/stream", nil)
+		if err != nil {
+			log.Printf("interval hub %s 连接失败: %v", h.interval, err)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+			}
+			continue
 		}
-		if ctx.Err() != nil {
-			return
-		}
-		log.Printf("监听 %s %s 连接断开: %v", w.symbol, w.interval, err)
+		conn.SetReadLimit(1 << 20)
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetPongHandler(func(string) error {
+			_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			return nil
+		})
+		h.connMu.Lock()
+		h.conn = conn
+		h.connMu.Unlock()
+		backoff = time.Second
+		h.resubscribeAll(conn)
+		errCh := make(chan error, 2)
+		go h.writer(conn, errCh)
+		go h.reader(conn, errCh)
 		select {
-		case <-ctx.Done():
+		case <-h.ctx.Done():
+			conn.Close()
+			h.connMu.Lock()
+			h.conn = nil
+			h.connMu.Unlock()
 			return
-		case <-time.After(backoff):
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("interval hub %s 连接断开: %v", h.interval, err)
+			}
+			conn.Close()
+			h.connMu.Lock()
+			h.conn = nil
+			h.connMu.Unlock()
 		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
+	}
+}
+
+func (h *intervalHub) writer(conn *websocket.Conn, errCh chan<- error) {
+	pingTicker := time.NewTicker(15 * time.Second)
+	defer pingTicker.Stop()
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case sym := <-h.subscribe:
+			if err := h.sendCommand(conn, "SUBSCRIBE", []string{strings.ToLower(sym) + "@kline_" + h.interval}); err != nil {
+				errCh <- err
+				return
+			}
+		case sym := <-h.unsubscribe:
+			if err := h.sendCommand(conn, "UNSUBSCRIBE", []string{strings.ToLower(sym) + "@kline_" + h.interval}); err != nil {
+				errCh <- err
+				return
+			}
+		case <-pingTicker.C:
+			if err := conn.SetWriteDeadline(time.Now().Add(15 * time.Second)); err != nil {
+				errCh <- err
+				return
+			}
+			if err := conn.WriteMessage(websocket.PingMessage, []byte("ping")); err != nil {
+				errCh <- err
+				return
 			}
 		}
 	}
 }
 
-func (w *intervalWatcher) connect(ctx context.Context) error {
-	endpoint := fmt.Sprintf("%s/%s@kline_%s", wsBaseURL, strings.ToLower(w.symbol), w.interval)
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, endpoint, nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	conn.SetReadLimit(1 << 20)
+func (h *intervalHub) reader(conn *websocket.Conn, errCh chan<- error) {
 	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if h.ctx.Err() != nil {
+			return
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		if err := conn.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
+			errCh <- err
+			return
+		}
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			return err
+			errCh <- err
+			return
 		}
-		var evt wsKlineEvent
+		if len(data) == 0 {
+			continue
+		}
+		if bytes.Equal(data, []byte("pong")) {
+			continue
+		}
+		if bytes.Contains(data, []byte("\"result\"")) {
+			continue
+		}
+		var evt combinedStreamEvent
 		if err := json.Unmarshal(data, &evt); err != nil {
 			continue
 		}
-		if !evt.Kline.Final {
-			continue
-		}
-		c, err := evt.toCandle()
+		candle, err := evt.Data.toCandle()
 		if err != nil {
 			continue
 		}
-		w.upsert(c)
+		symbol := strings.ToUpper(evt.Data.Symbol)
+		if symbol == "" && evt.Stream != "" {
+			parts := strings.Split(evt.Stream, "@")
+			if len(parts) > 0 {
+				symbol = strings.ToUpper(parts[0])
+			}
+		}
+		if symbol == "" {
+			continue
+		}
+		h.dispatch(symbol, candle)
 	}
+}
+
+func (h *intervalHub) dispatch(symbol string, candle candle) {
+	watcher := h.mgr.getWatcher(symbol, strings.ToLower(h.interval))
+	if watcher == nil {
+		return
+	}
+	watcher.upsert(candle)
+}
+
+func (h *intervalHub) sendCommand(conn *websocket.Conn, method string, params []string) error {
+	if conn == nil {
+		h.connMu.Lock()
+		conn = h.conn
+		h.connMu.Unlock()
+		if conn == nil {
+			return nil
+		}
+	}
+	payload := map[string]interface{}{
+		"method": strings.ToUpper(method),
+		"params": params,
+	}
+	h.commandMu.Lock()
+	h.nextID++
+	payload["id"] = h.nextID
+	if err := conn.SetWriteDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		h.commandMu.Unlock()
+		return err
+	}
+	err := conn.WriteJSON(payload)
+	h.commandMu.Unlock()
+	return err
+}
+
+func (h *intervalHub) resubscribeAll(conn *websocket.Conn) {
+	h.mgr.mu.RLock()
+	intervalMap := h.mgr.watchers[strings.ToLower(h.interval)]
+	symbols := make([]string, 0, len(intervalMap))
+	for sym := range intervalMap {
+		symbols = append(symbols, sym)
+	}
+	h.mgr.mu.RUnlock()
+	for _, sym := range symbols {
+		_ = h.sendCommand(conn, "SUBSCRIBE", []string{strings.ToLower(sym) + "@kline_" + h.interval})
+	}
+}
+
+func (h *intervalHub) addSymbol(symbol string) {
+	select {
+	case h.subscribe <- symbol:
+	default:
+		go func() { h.subscribe <- symbol }()
+	}
+}
+
+func (h *intervalHub) removeSymbol(symbol string) {
+	select {
+	case h.unsubscribe <- symbol:
+	default:
+		go func() { h.unsubscribe <- symbol }()
+	}
+}
+
+func (h *intervalHub) Close() {
+	h.cancel()
+	h.connMu.Lock()
+	if h.conn != nil {
+		h.conn.Close()
+		h.conn = nil
+	}
+	h.connMu.Unlock()
 }
 
 func (w *intervalWatcher) upsert(c candle) {
@@ -371,12 +539,7 @@ func (w *intervalWatcher) snapshot() []candle {
 	return dedupeCandles(copyCandles)
 }
 
-func (w *intervalWatcher) Close() {
-	if w.cancel != nil {
-		w.cancel()
-	}
-	<-w.done
-}
+func (w *intervalWatcher) Close() {}
 
 func (m *symbolManager) EnsureWatchers(ctx context.Context, symbols []string) {
 	for _, sym := range symbols {
@@ -416,7 +579,9 @@ func (m *symbolManager) ensureIntervalWatcher(ctx context.Context, symbol, inter
 	}
 	intervalMap[strings.ToUpper(symbol)] = watcher
 	m.mu.Unlock()
-	watcher.start(ctx)
+	if hub := m.getHub(interval); hub != nil {
+		hub.addSymbol(symbol)
+	}
 	log.Printf("开始监听 %s %s，初始K线: %d 条", symbol, interval, len(candles))
 }
 
@@ -427,6 +592,12 @@ func (m *symbolManager) getWatcher(symbol, interval string) *intervalWatcher {
 		return intervalMap[strings.ToUpper(symbol)]
 	}
 	return nil
+}
+
+func (m *symbolManager) getHub(interval string) *intervalHub {
+	m.hubMu.RLock()
+	defer m.hubMu.RUnlock()
+	return m.hubs[strings.ToLower(interval)]
 }
 
 func (m *symbolManager) SetCandleHandler(handler func(string, string)) {
@@ -465,20 +636,20 @@ func (m *symbolManager) EvaluateStrategies(symbols []string) []strategyResult {
 
 func (m *symbolManager) Close() {
 	m.mu.Lock()
-	watchers := make([]*intervalWatcher, 0)
-	for _, intervalMap := range m.watchers {
-		for _, w := range intervalMap {
-			watchers = append(watchers, w)
-		}
-	}
 	for _, intervalMap := range m.watchers {
 		for k := range intervalMap {
 			delete(intervalMap, k)
 		}
 	}
 	m.mu.Unlock()
-	for _, w := range watchers {
-		w.Close()
+	m.hubMu.RLock()
+	hubs := make([]*intervalHub, 0, len(m.hubs))
+	for _, hub := range m.hubs {
+		hubs = append(hubs, hub)
+	}
+	m.hubMu.RUnlock()
+	for _, hub := range hubs {
+		hub.Close()
 	}
 }
 
