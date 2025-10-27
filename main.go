@@ -171,8 +171,9 @@ type symbolManager struct {
 }
 
 type symbolFilter struct {
-	stepSize float64
-	minQty   float64
+	stepSize    float64
+	minQty      float64
+	stepSizeStr string
 }
 
 type wsKlineEvent struct {
@@ -250,9 +251,6 @@ func newSymbolManager(client *http.Client, cfg config) *symbolManager {
 		client:   client,
 		cfg:      cfg,
 		onCandle: nil,
-	}
-	for _, iv := range intervalConfigs {
-		mgr.hubs[strings.ToLower(iv.Name)] = newIntervalHub(mgr, iv.Name)
 	}
 	return mgr
 }
@@ -541,6 +539,42 @@ func (w *intervalWatcher) snapshot() []candle {
 
 func (w *intervalWatcher) Close() {}
 
+func (w *intervalWatcher) mergeCandles(newCandles []candle) {
+	if len(newCandles) == 0 {
+		return
+	}
+	w.mu.Lock()
+	handler := w.onCandle
+	combined := append([]candle{}, w.candles...)
+	combined = append(combined, newCandles...)
+	sort.Slice(combined, func(i, j int) bool {
+		return combined[i].OpenTime.Before(combined[j].OpenTime)
+	})
+	merged := make([]candle, 0, len(combined))
+	for _, c := range combined {
+		if len(merged) == 0 {
+			merged = append(merged, c)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		if last.OpenTime.Equal(c.OpenTime) {
+			*last = c
+			continue
+		}
+		if c.OpenTime.After(last.OpenTime) {
+			merged = append(merged, c)
+		}
+	}
+	if len(merged) > positionKlineLimit {
+		merged = merged[len(merged)-positionKlineLimit:]
+	}
+	w.candles = merged
+	w.mu.Unlock()
+	if handler != nil {
+		go handler(w.symbol, w.interval)
+	}
+}
+
 func (m *symbolManager) EnsureWatchers(ctx context.Context, symbols []string) {
 	for _, sym := range symbols {
 		sym = strings.ToUpper(sym)
@@ -567,7 +601,7 @@ func (m *symbolManager) ensureIntervalWatcher(ctx context.Context, symbol, inter
 	candles, err := fetchHistoricalInterval(ctxTimeout, m.client, symbol, interval, initialKlineLimit)
 	cancel()
 	if err != nil {
-		log.Printf("初始化 %s %s 监听失败: %v", symbol, interval, err)
+		log.Printf("初始化 %s %s 数据失败: %v", symbol, interval, err)
 		return
 	}
 	watcher := newIntervalWatcher(symbol, interval, duration, candles, onCandle)
@@ -579,10 +613,10 @@ func (m *symbolManager) ensureIntervalWatcher(ctx context.Context, symbol, inter
 	}
 	intervalMap[strings.ToUpper(symbol)] = watcher
 	m.mu.Unlock()
-	if hub := m.getHub(interval); hub != nil {
-		hub.addSymbol(symbol)
+	log.Printf("初始化 %s %s，历史K线: %d 条", symbol, interval, len(candles))
+	if onCandle != nil {
+		go onCandle(symbol, strings.ToLower(interval))
 	}
-	log.Printf("开始监听 %s %s，初始K线: %d 条", symbol, interval, len(candles))
 }
 
 func (m *symbolManager) getWatcher(symbol, interval string) *intervalWatcher {
@@ -632,6 +666,98 @@ func (m *symbolManager) EvaluateStrategies(symbols []string) []strategyResult {
 		results = append(results, rs)
 	}
 	return results
+}
+
+func intervalDuration(interval string) time.Duration {
+	for _, cfg := range intervalConfigs {
+		if strings.EqualFold(cfg.Name, interval) {
+			return cfg.Duration
+		}
+	}
+	d, err := time.ParseDuration(interval)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+func (m *symbolManager) refreshInterval(ctx context.Context, interval string, limit int) {
+	m.mu.RLock()
+	intervalMap := m.watchers[interval]
+	watchers := make([]*intervalWatcher, 0, len(intervalMap))
+	for _, w := range intervalMap {
+		watchers = append(watchers, w)
+	}
+	m.mu.RUnlock()
+	if len(watchers) == 0 {
+		return
+	}
+	dur := intervalDuration(interval)
+	if dur <= 0 {
+		dur = time.Minute
+	}
+	for _, w := range watchers {
+		attempts := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			pollCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			candles, err := fetchHistoricalInterval(pollCtx, m.client, w.symbol, interval, limit)
+			cancel()
+			if err != nil {
+				attempts++
+				if attempts >= 3 {
+					log.Printf("刷新 %s %s 失败: %v", w.symbol, interval, err)
+					break
+				}
+				time.Sleep(time.Second)
+				continue
+			}
+			clean := dedupeCandles(candles)
+			if len(clean) == 0 {
+				attempts++
+				if attempts >= 3 {
+					log.Printf("刷新 %s %s 返回空数据", w.symbol, interval)
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			last := clean[len(clean)-1].CloseTime
+			if time.Since(last) > dur {
+				attempts++
+				if attempts >= 3 {
+					log.Printf("刷新 %s %s 数据过旧，最后收盘 %s", w.symbol, interval, last.Format(time.RFC3339))
+					break
+				}
+				time.Sleep(time.Second)
+				continue
+			}
+			w.mergeCandles(clean)
+			break
+		}
+	}
+}
+
+func (m *symbolManager) startIntervalPolling(ctx context.Context, interval string, duration time.Duration, limit int) {
+	go func() {
+		for {
+			next := time.Now().Truncate(duration).Add(duration)
+			delay := time.Until(next)
+			if delay < 0 {
+				delay = duration
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+				m.refreshInterval(ctx, interval, limit)
+			}
+		}
+	}()
 }
 
 func (m *symbolManager) Close() {
@@ -874,6 +1000,7 @@ func (c *binanceClient) getSymbolFilter(ctx context.Context, symbol string) (sym
 					}
 					lot.stepSize = step
 					lot.minQty = min
+					lot.stepSizeStr = flt.StepSize
 				}
 			}
 			break
@@ -900,11 +1027,25 @@ func (c *binanceClient) AdjustQuantity(ctx context.Context, symbol string, qty f
 		return 0, fmt.Errorf("%s 步长限制无效", symbol)
 	}
 	step := filter.stepSize
-	adjusted := math.Floor(qty/step) * step
+	steps := math.Floor(qty/step + 1e-9)
+	adjusted := steps * step
 	if adjusted < filter.minQty {
 		return 0, fmt.Errorf("%s 数量 %.8f 低于最小下单量 %.8f", symbol, adjusted, filter.minQty)
 	}
 	return adjusted, nil
+}
+
+func (filter symbolFilter) decimals() int {
+	if strings.Contains(filter.stepSizeStr, ".") {
+		step := strings.TrimRight(filter.stepSizeStr, "0")
+		if strings.HasSuffix(step, ".") {
+			step = step[:len(step)-1]
+		}
+		if idx := strings.Index(step, "."); idx >= 0 {
+			return len(step) - idx - 1
+		}
+	}
+	return 0
 }
 
 type orderRequest struct {
@@ -912,6 +1053,21 @@ type orderRequest struct {
 	Side         string
 	PositionSide string
 	Quantity     float64
+}
+
+func (c *binanceClient) formatQuantity(ctx context.Context, symbol string, qty float64) (string, error) {
+	filter, err := c.getSymbolFilter(ctx, symbol)
+	if err != nil {
+		return "", err
+	}
+	decimals := filter.decimals()
+	formatted := strconv.FormatFloat(qty, 'f', decimals, 64)
+	formatted = strings.TrimRight(formatted, "0")
+	formatted = strings.TrimRight(formatted, ".")
+	if formatted == "" {
+		formatted = "0"
+	}
+	return formatted, nil
 }
 
 type reentryState struct {
@@ -948,14 +1104,26 @@ type candleSnapshot struct {
 	Created  time.Time
 }
 
+func isInsufficientMarginError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "-2019") || strings.Contains(strings.ToLower(msg), "insufficient")
+}
+
 func (c *binanceClient) PlaceOrder(ctx context.Context, req orderRequest) error {
 	params := url.Values{}
 	params.Set("symbol", req.Symbol)
 	params.Set("side", req.Side)
 	params.Set("type", "MARKET")
-	params.Set("quantity", formatQuantity(req.Quantity))
+	qtyStr, err := c.formatQuantity(ctx, req.Symbol, req.Quantity)
+	if err != nil {
+		return err
+	}
+	params.Set("quantity", qtyStr)
 	params.Set("positionSide", req.PositionSide)
-	_, err := c.signedRequest(ctx, http.MethodPost, "/fapi/v1/order", params)
+	_, err = c.signedRequest(ctx, http.MethodPost, "/fapi/v1/order", params)
 	return err
 }
 
@@ -2604,7 +2772,6 @@ func (tm *tradeManager) openPosition(ctx context.Context, symbol, side string, p
 	}
 	order := orderRequest{
 		Symbol:       symbol,
-		Quantity:     qty,
 		PositionSide: side,
 	}
 	switch side {
@@ -2615,22 +2782,53 @@ func (tm *tradeManager) openPosition(ctx context.Context, symbol, side string, p
 	default:
 		return fmt.Errorf("未知的持仓方向: %s", side)
 	}
-	log.Printf("下单请求: %s %s 数量 %s", symbol, side, formatQuantity(qty))
-	if err := tm.client.PlaceOrder(ctx, order); err != nil {
-		return err
+	attemptQty := qty
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attemptQty <= 0 {
+			break
+		}
+		formattedQty, err := tm.client.formatQuantity(ctx, symbol, attemptQty)
+		if err != nil {
+			return err
+		}
+		log.Printf("下单请求: %s %s 数量 %s", symbol, side, formattedQty)
+		order.Quantity = attemptQty
+		if err := tm.client.PlaceOrder(ctx, order); err != nil {
+			lastErr = err
+			if isInsufficientMarginError(err) {
+				attemptQty = attemptQty * 0.8
+				adjusted, adjErr := tm.client.AdjustQuantity(ctx, symbol, attemptQty)
+				if adjErr != nil {
+					return adjErr
+				}
+				attemptQty = adjusted
+				continue
+			}
+			return err
+		}
+		qty = attemptQty
+		break
+	}
+	if lastErr != nil {
+		return lastErr
 	}
 	if err := tm.refreshPositions(ctx); err != nil {
 		log.Printf("刷新持仓失败: %v", err)
 		tm.positions.Set(symbol, side, qty)
 	}
 	tm.setEntryTime(symbol, side, time.Now())
-	log.Printf("%s %s 开仓成功，数量 %s", symbol, side, formatQuantity(qty))
+	formattedQty, err := tm.client.formatQuantity(ctx, symbol, qty)
+	if err != nil {
+		formattedQty = formatQuantity(qty)
+	}
+	log.Printf("%s %s 开仓成功，数量 %s", symbol, side, formattedQty)
 	rank := tm.getVolumeRank(symbol)
 	rankLine := ""
 	if rank > 0 {
 		rankLine = fmt.Sprintf("\n成交量排名: #%d", rank)
 	}
-	tm.sendTelegram(ctx, fmt.Sprintf("✅ 开仓 %s %s\n数量: %s\n价格: %.6f%s", symbol, side, formatQuantity(qty), price, rankLine))
+	tm.sendTelegram(ctx, fmt.Sprintf("✅ 开仓 %s %s\n数量: %s\n价格: %.6f%s", symbol, side, formattedQty, price, rankLine))
 	return nil
 }
 
@@ -2805,7 +3003,11 @@ func (tm *tradeManager) closePosition(ctx context.Context, symbol, side string) 
 	default:
 		return fmt.Errorf("未知的持仓方向: %s", side)
 	}
-	log.Printf("平仓请求: %s %s 数量 %s", symbol, side, formatQuantity(adjQty))
+	fmtQty, err := tm.client.formatQuantity(ctx, symbol, adjQty)
+	if err != nil {
+		fmtQty = formatQuantity(adjQty)
+	}
+	log.Printf("平仓请求: %s %s 数量 %s", symbol, side, fmtQty)
 	if err := tm.client.PlaceOrder(ctx, order); err != nil {
 		return err
 	}
@@ -2814,8 +3016,8 @@ func (tm *tradeManager) closePosition(ctx context.Context, symbol, side string) 
 		tm.positions.Remove(symbol, side)
 	}
 	tm.clearEntryTime(symbol, side)
-	log.Printf("%s %s 平仓成功，数量 %s", symbol, side, formatQuantity(adjQty))
-	tm.sendTelegram(ctx, fmt.Sprintf("✅ 平仓 %s %s\n数量: %s", symbol, side, formatQuantity(adjQty)))
+	log.Printf("%s %s 平仓成功，数量 %s", symbol, side, fmtQty)
+	tm.sendTelegram(ctx, fmt.Sprintf("✅ 平仓 %s %s\n数量: %s", symbol, side, fmtQty))
 	return nil
 }
 
@@ -3117,6 +3319,10 @@ func run(cfg config) error {
 		log.Printf("当前持仓数量: %d / %d", tradeMgr.positions.Count(), cfg.maxPositions)
 		watchMgr.SetCandleHandler(tradeMgr.OnCandleUpdate)
 		initializeExistingPositions(ctx, tradeMgr)
+	}
+
+	for _, iv := range intervalConfigs {
+		watchMgr.startIntervalPolling(ctx, iv.Name, iv.Duration, 10)
 	}
 
 	var (

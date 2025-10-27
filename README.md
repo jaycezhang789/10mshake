@@ -7,7 +7,7 @@ Go 编写的币安 U 本位合约量化框架。程序自动筛选成交量最�
 ## 功能概览
 
 - **成交量筛选**：每 4 小时拉取全部 USDT 永续合约 24h 成交量，只保留排名前 50% 的交易对作为候选池。
-- **实时行情**：为候选池订阅 Binance `kline_3m` / `kline_5m` 合并流；启动时会用 REST 补齐 499 根历史 K 线。
+- **定时行情**：启动时用 REST 拉取 499 根 3m/5m K 线；之后在每个 3m、5m 整点自动拉取最新 10 根 K 线（带重试与去重），无需 WebSocket。
 - **双周期策略**：
   - 5m 负责判定趋势方向（EMA 差值归一化、ADX 斜率、MACD 动量）。
   - 3m 负责择时（MACD 零轴滞回、EMA 快线回踩再上、动量放大）。
@@ -96,8 +96,8 @@ go run . -update-interval 5m -auto-trade=false
 1. **成交量刷新**  
    `refreshVolumeList` 请求 `ticker/24hr`，结合 `exchangeInfo` 获取所有 USDT 永续合约成交量，按成交量降序截取前 50%。结果存入内存，供后续评估使用。
 
-2. **行情补齐与订阅**  
-   `EnsureWatchers` 为每个候选交易对初始化 `intervalWatcher`：先用 REST 拉取 499 根历史 K 线，随后交由 `intervalHub` 共享的 WebSocket 连接统一订阅 `kline_3m` / `kline_5m`。
+2. **行情补齐与轮询**  
+   `EnsureWatchers` 为每个候选交易对初始化 `intervalWatcher`：先用 REST 拉取 499 根历史 K 线，随后由定时任务在每个 3m、5m 整点再次拉取最新 10 根 K 线并合并去重；当检测到 K 线更新时即刻触发策略评估。
 
 3. **实时评估**  
    每当 WebSocket 接收到收盘 K 线，`OnCandleUpdate` 会：
